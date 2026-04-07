@@ -1,0 +1,126 @@
+# ============================================================
+# Bladder Sonography Deep Learning Project — Master Config
+# GE XDclear | C1-6 probe | 3 MHz | Suprapubic | 2D only
+# ============================================================
+
+project:
+  name: "bladder_sono_dl"
+  version: "1.0"
+  seed: 42
+
+# ── Physical constants ──────────────────────────────────────
+physics:
+  bladder_tissue_density: 0.957     # g/cm³ — finalized
+  volume_coefficient:     0.52      # ellipsoid formula: 0.52 × d1 × d2 × d3
+
+# ── Dataset paths ───────────────────────────────────────────
+paths:
+  raw_data:     "data/raw/"
+  processed:    "data/processed/"
+  annotations:  "data/annotations/"
+  checkpoints:  "outputs/checkpoints/"
+  figures:      "outputs/figures/"
+  tables:       "outputs/tables/"
+  logs:         "outputs/logs/"
+
+# ── Dataset split ───────────────────────────────────────────
+dataset:
+  train_ratio: 0.70
+  val_ratio:   0.15
+  test_ratio:  0.15
+  # Image counts (update as you collect data)
+  ipp_count:   52
+  dwt_count:   14          # DWT-only
+  mixed_count: 349         # IPP + DWT both present
+  volume_count: 0          # update
+
+# ── Image preprocessing ─────────────────────────────────────
+preprocessing:
+  target_size:    [512, 512]     # H × W  (use 512 for DWT fine detail)
+  grayscale:      true
+
+  # GE XDclear screen crop offsets (pixels, for your screenshots)
+  crop:
+    top:    80      # remove header bar (clinic name, date)
+    bottom: 280     # remove measurement overlay box
+    left:   0
+    right:  220     # remove settings panel (Frq, Gn, Map etc.)
+
+  # Noise reduction: "median" or "bilateral"
+  denoise:
+    method:         "bilateral"
+    median_ksize:   5
+    bilateral_d:    9
+    bilateral_sigma_color: 75
+    bilateral_sigma_space: 75
+
+  # CLAHE contrast enhancement
+  clahe:
+    clip_limit:  2.0
+    tile_grid:   [8, 8]
+
+  # Intensity normalization: "minmax" or "zscore"
+  normalization: "percentile_clip"
+  percentile_low:  1.0               # clip bottom 1% of pixels
+  percentile_high: 99.0              # clip top 99% of pixels
+
+# ── Annotation / Mask classes ───────────────────────────────
+annotation:
+  # Multi-class mask encoding
+  classes:
+    background:      0
+    bladder_inner:   1    # inner lumen boundary
+    bladder_outer:   2    # outer wall boundary
+    prostate:        3    # prostate region
+  # IPP landmark points (JSON, not mask)
+  ipp_landmarks:
+    - "bladder_neck"      # base point
+    - "prostatic_tip"     # tip of protrusion
+
+# ── Training ────────────────────────────────────────────────
+training:
+  model:          "multitask_unet"   # see src/models/
+  backbone:       "resnet34"
+  pretrained:     true               # ImageNet weights → transfer learning
+  input_channels: 1                  # grayscale
+  num_classes:    4                  # background + 3 structures
+
+  epochs:         100
+  batch_size:     8
+  learning_rate:  0.0001
+  optimizer:      "adam"
+  scheduler:      "cosine"
+
+  # Loss function weights (multi-task)
+  loss_weights:
+    segmentation: 1.0
+    dwt_reg:      0.5
+    ipp_reg:      0.5
+    volume_reg:   0.3
+    uebw_reg:     0.3
+
+# ── Augmentation ────────────────────────────────────────────
+augmentation:
+  horizontal_flip:  true
+  rotation_limit:   10       # ±10 degrees only
+  scale_limit:      0.1      # ±10%
+  brightness_limit: 0.15
+  elastic_alpha:    30       # light elastic deform
+  elastic_sigma:    5
+  # NEVER use: vertical_flip, large rotations, perspective warp
+
+# ── Clinical thresholds (for evaluation) ────────────────────
+clinical:
+  ipp_grade_1_max:  10.0    # mm
+  ipp_grade_2_max:  20.0    # mm
+  dwt_normal_max:   3.0     # mm (at 150-250 mL fill)
+  dwt_boo_cutoff:   5.0     # mm
+  uebw_boo_cutoff:  35.0    # g  (Bright et al.)
+  fill_vol_min:     150     # mL
+  fill_vol_max:     350     # mL
+
+# ── Pixel spacing (GE XDclear at standard depth) ────────────
+# CRITICAL: update per image from DICOM metadata or scale bar
+pixel_spacing:
+  default_mm_per_pixel: 0.1   # placeholder — extract per image
+  scale_bar_present:    true  # GE shows scale bar (0, -10, -15 cm)
