@@ -24,14 +24,49 @@ def click_event(event, x, y, flags, param):
 
         cv2.imshow("Annotate", img_display)
 
+
+# ------------------ AUTO PIXEL SPACING ------------------
+def auto_pixel_spacing(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    # Crop right-most area (scale region)
+    scale_region = gray[:, int(w * 0.9):]
+
+    # Edge detection
+    edges = cv2.Canny(scale_region, 50, 150)
+
+    # Sum edges vertically
+    row_sum = np.sum(edges, axis=1)
+
+    # Find strong responses (tick marks)
+    peaks = np.where(row_sum > np.mean(row_sum))[0]
+
+    if len(peaks) < 2:
+        print("⚠️ Scale detection failed, using fallback")
+        return 0.1  # fallback
+
+    y1 = peaks[0]
+    y2 = peaks[-1]
+
+    pixel_dist = abs(y2 - y1)
+
+    real_distance_mm = 100  # assume 10 cm scale
+
+    pixel_spacing = real_distance_mm / pixel_dist
+
+    print("✅ Auto pixel spacing:", pixel_spacing, "mm/pixel")
+
+    return pixel_spacing
+
+
 # ------------------ MAIN PIPELINE ------------------
 def process_and_annotate(image_path):
     global points, img_display
 
-    # Load image
     image = cv2.imread(image_path)
 
-    # --------- STEP 1: RECTANGLE + ROI ----------
+    # --------- ROI ----------
     x1, y1 = 324, 116
     x2, y2 = 1441, 958
 
@@ -40,31 +75,27 @@ def process_and_annotate(image_path):
     roi = image[y1:y2, x1:x2]
     h, w = roi.shape[:2]
 
-    # --------- STEP 2: SPLIT ----------
+    # --------- SPLIT ----------
     left = roi[:, :w//2]
     right = roi[:, w//2:]
 
-    # --------- STEP 3: VISUALIZE ----------
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-
+    # --------- VISUAL ----------
     plt.figure(figsize=(8, 6))
     plt.subplot(1, 2, 1)
     plt.title("ROI")
-    plt.imshow(roi_rgb)
+    plt.imshow(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
     plt.axis('off')
 
-    
     plt.subplot(1, 2, 2)
-    plt.title("Split View")
-    plt.imshow(image_rgb)
+    plt.title("Full Image")
+    plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
     plt.axis('off')
 
     plt.show()
-    
     plt.pause(2)
     plt.close()
-    # --------- STEP 4: ANNOTATE LEFT ----------
+
+    # --------- LEFT ----------
     print("\nSTEP 1: LEFT IMAGE")
     print("Click 4 points:")
     print("1-2: Length")
@@ -78,7 +109,7 @@ def process_and_annotate(image_path):
 
     left_pts = points.copy()
 
-    # --------- STEP 5: ANNOTATE RIGHT ----------
+    # --------- RIGHT ----------
     print("\nSTEP 2: RIGHT IMAGE")
     print("Click 2 points:")
     print("Depth")
@@ -88,6 +119,7 @@ def process_and_annotate(image_path):
     cv2.imshow("Annotate", img_display)
     cv2.setMouseCallback("Annotate", click_event)
     cv2.waitKey(0)
+
     cv2.destroyAllWindows()
 
     right_pts = points.copy()
@@ -96,32 +128,48 @@ def process_and_annotate(image_path):
 
 
 # ------------------ VOLUME ------------------
-def compute_volume(left_pts, right_pts):
+def compute_volume(left_pts, right_pts, image_path):
+
+    image = cv2.imread(image_path)
+
+    # 🔥 AUTO PIXEL SPACING
+    pixel_spacing = auto_pixel_spacing(image)
+
+    # Safety check
+    if len(left_pts) < 4 or len(right_pts) < 2:
+        print("❌ Not enough points selected!")
+        return None
+
     L_px = distance(left_pts[0], left_pts[1])
     W_px = distance(left_pts[2], left_pts[3])
     H_px = distance(right_pts[0], right_pts[1])
-    pixel_spacing=81.70/L_px
-    print("L in px",L_px)
-    print("W in px",W_px)
-    print("H in px",H_px)
-    
-    # px → mm
+
+    print("\n--- Pixel Measurements ---")
+    print("L_px:", L_px)
+    print("W_px:", W_px)
+    print("H_px:", H_px)
+
+    # px → cm
     L = (L_px * pixel_spacing) / 10
     W = (W_px * pixel_spacing) / 10
     H = (H_px * pixel_spacing) / 10
-    print("L in mm",L)
-    print("W in mm",W)
-    print("H in mm",H)
+
+    print("\n--- Real Dimensions (cm) ---")
+    print("L:", L)
+    print("W:", W)
+    print("H:", H)
+
     volume = 0.52 * L * W * H
+
     return volume
 
 
 # ------------------ RUN ------------------
 if __name__ == "__main__":
-    image_path = r"D:\Bladder-images-processing\img012.jpg"
+    image_path = "D:\Bladder-images-processing\img012.jpg"
 
     left_pts, right_pts = process_and_annotate(image_path)
 
-    vol = compute_volume(left_pts, right_pts)
+    vol = compute_volume(left_pts, right_pts, image_path)
 
-    print("\nEstimated Volume:", vol, "ml")
+    print("\n✅ Estimated Volume:", vol, "ml")
