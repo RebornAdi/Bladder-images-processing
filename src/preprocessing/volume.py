@@ -85,7 +85,7 @@ def compute_volume(left_pts, right_pts, pixel_spacing=0.1):
 
 
 if __name__ == "__main__":
-    image_path = r"C:\Users\Aditya Atul Deshmukh\Desktop\Nidhi_proj\data\processed\images\img012.jpg"
+    image_path = r"D:\Bladder-images-processing\img012.jpg"
 
     left_pts, right_pts = annotate_dual(image_path)
 
