@@ -26,36 +26,33 @@ def click_event(event, x, y, flags, param):
 
 
 # ------------------ AUTO PIXEL SPACING ------------------
-def auto_pixel_spacing(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+def get_pixel_spacing_manual(image):
+    global points, img_display
 
-    # Crop right-most area (scale region)
-    scale_region = gray[:, int(w * 0.9):]
+    print("\nSTEP 0: SCALE CALIBRATION")
+    print("Click 2 points on scale bar (e.g., 0 cm to 10 cm)")
 
-    # Edge detection
-    edges = cv2.Canny(scale_region, 50, 150)
+    points = []
+    img_display = image.copy()
 
-    # Sum edges vertically
-    row_sum = np.sum(edges, axis=1)
+    cv2.imshow("Scale Calibration", img_display)
+    cv2.setMouseCallback("Scale Calibration", click_event)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Scale Calibration")
 
-    # Find strong responses (tick marks)
-    peaks = np.where(row_sum > np.mean(row_sum))[0]
+    if len(points) < 2:
+        print("Calibration failed")
+        return 0.1
 
-    if len(peaks) < 2:
-        print("⚠️ Scale detection failed, using fallback")
-        return 0.1  # fallback
+    p1, p2 = points[0], points[1]
 
-    y1 = peaks[0]
-    y2 = peaks[-1]
+    pixel_dist = distance(p1, p2)
 
-    pixel_dist = abs(y2 - y1)
+    real_mm = 100  # 10 cm scale
 
-    real_distance_mm = 100  # assume 10 cm scale
+    pixel_spacing = real_mm / pixel_dist
 
-    pixel_spacing = real_distance_mm / pixel_dist
-
-    print("✅ Auto pixel spacing:", pixel_spacing, "mm/pixel")
+    print("Correct pixel spacing:", pixel_spacing)
 
     return pixel_spacing
 
@@ -133,11 +130,11 @@ def compute_volume(left_pts, right_pts, image_path):
     image = cv2.imread(image_path)
 
     # 🔥 AUTO PIXEL SPACING
-    pixel_spacing = auto_pixel_spacing(image)
+    pixel_spacing = get_pixel_spacing_manual(image)
 
     # Safety check
     if len(left_pts) < 4 or len(right_pts) < 2:
-        print("❌ Not enough points selected!")
+        print("Not enough points selected!")
         return None
 
     L_px = distance(left_pts[0], left_pts[1])
@@ -172,4 +169,4 @@ if __name__ == "__main__":
 
     vol = compute_volume(left_pts, right_pts, image_path)
 
-    print("\n✅ Estimated Volume:", vol, "ml")
+    print("\n Estimated Volume:", vol, "ml")
