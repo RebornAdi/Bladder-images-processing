@@ -187,7 +187,7 @@ def compute_volume(left_pts, right_pts, pixel_spacing):
 
 # ------------------ RUN ------------------
 if __name__ == "__main__":
-    image_path = r"D:\Bladder-images-processing\img13.jpg"
+    image_path = r"img012.jpg"
 
     image = cv2.imread(image_path)
 
