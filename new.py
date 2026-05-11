@@ -163,7 +163,7 @@ def compute_volume(left_pts, right_pts, image_path):
 
 # ------------------ RUN ------------------
 if __name__ == "__main__":
-    image_path = "D:\Bladder-images-processing\img012.jpg"
+    image_path = "img012.jpg"
 
     left_pts, right_pts = process_and_annotate(image_path)
 
