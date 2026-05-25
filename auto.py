@@ -105,43 +105,197 @@ def click_event(event, x, y, flags, param):
 
         cv2.imshow("Calibration", img_display)
 
-def get_pixel_spacing_manual(image):
+
+def save_calibration_image(image, path=r"D:\Bladder-images-processing\calibration.png"):
+    cv2.imwrite(path, image)
+    print(f"Calibration image saved to: {path}")
+    print("Open this file and manually enter two pixel coordinates for the scale bar.")
+    return path
+
+
+def query_manual_points():
+    manual_points = []
+    for i in range(2):
+        while True:
+            raw = input(f"Enter point {i+1} as x,y: ").strip()
+            try:
+                x_str, y_str = raw.split(",")
+                x, y = int(x_str), int(y_str)
+                manual_points.append((x, y))
+                break
+            except Exception:
+                print("Invalid entry. Use format x,y like 45,120.")
+    return manual_points
+
+
+def get_pixel_spacing_manual(image, scale_length_mm=100):
 
     global points, img_display
 
     print("\nCLICK 2 POINTS ON SCALE BAR")
+    print(f"Enter the known scale bar length in millimeters (default {scale_length_mm} mm).")
+
+    user_input = input("Scale length [mm]: ").strip()
+    if user_input:
+        try:
+            scale_length_mm = float(user_input)
+        except ValueError:
+            print("Invalid scale length input, using default", scale_length_mm, "mm")
 
     points = []
-
     img_display = image.copy()
 
+    cv2.namedWindow("Calibration", cv2.WINDOW_NORMAL)
     cv2.imshow("Calibration", img_display)
-
     cv2.setMouseCallback(
         "Calibration",
         click_event
     )
 
-    cv2.waitKey(0)
+    print("Click two points on the scale bar. Press ESC to cancel.")
 
-    cv2.destroyAllWindows()
+    # Give OpenCV one frame to create the window, then verify visibility.
+    if cv2.waitKey(1) & 0xFF == 27:
+        pass
+    vis = cv2.getWindowProperty("Calibration", cv2.WND_PROP_VISIBLE)
+    if vis < 1:
+        window_failed = True
+    else:
+        window_failed = False
+
+    if window_failed:
+        cv2.destroyAllWindows()
+        save_calibration_image(image)
+        points = query_manual_points()
+    else:
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if len(points) >= 2 or key == 27:
+                break
+        cv2.destroyAllWindows()
 
     if len(points) < 2:
+        print("Calibration failed or canceled, using default 0.1 mm/pixel.")
         return 0.1
 
     p1, p2 = points[:2]
-
     pixel_dist = distance(p1, p2)
 
     if pixel_dist == 0:
+        print("Invalid calibration points, using default 0.1 mm/pixel.")
         return 0.1
 
-    # 10 cm scale
-    pixel_spacing = 100 / pixel_dist
+    pixel_spacing = float(scale_length_mm) / pixel_dist
 
-    print("Pixel spacing:", pixel_spacing)
+    print("Pixel spacing:", pixel_spacing, "mm/pixel")
 
     return pixel_spacing
+
+# ---------------------------------------------------------
+# LINE DETECTION & MEASUREMENT
+# ---------------------------------------------------------
+def detect_lines(image, min_length=50, max_gap=20, threshold=40):
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi/180,
+        threshold,
+        minLineLength=min_length,
+        maxLineGap=max_gap
+    )
+
+    if lines is None:
+        return []
+
+    return [tuple(line[0]) for line in lines]
+
+
+def line_length(line):
+    x1, y1, x2, y2 = line
+    return np.hypot(x2 - x1, y2 - y1)
+
+
+def line_angle_deg(line):
+    x1, y1, x2, y2 = line
+    return np.degrees(np.arctan2(y2 - y1, x2 - x1))
+
+
+def select_cross_lines(lines):
+    if not lines:
+        return None, None
+
+    horizontal = [l for l in lines if abs(line_angle_deg(l)) < 20 or abs(abs(line_angle_deg(l)) - 180) < 20]
+    vertical = [l for l in lines if abs(abs(line_angle_deg(l)) - 90) < 20]
+
+    if horizontal and vertical:
+        h_line = max(horizontal, key=line_length)
+        v_line = max(vertical, key=line_length)
+        L_px = max(line_length(h_line), line_length(v_line))
+        W_px = min(line_length(h_line), line_length(v_line))
+        return L_px, W_px
+
+    sorted_lines = sorted(lines, key=line_length, reverse=True)
+    if len(sorted_lines) >= 2:
+        L_px = line_length(sorted_lines[0])
+        W_px = line_length(sorted_lines[1])
+        return max(L_px, W_px), min(L_px, W_px)
+
+    return None, None
+
+
+def select_depth_line(lines):
+    if not lines:
+        return None
+
+    slanted = [
+        l for l in lines
+        if 20 < abs(line_angle_deg(l)) < 70 or 110 < abs(line_angle_deg(l)) < 160
+    ]
+    if slanted:
+        return max(slanted, key=line_length)
+
+    return max(lines, key=line_length)
+
+
+def draw_line_overlay(image, lines, title):
+    debug = image.copy()
+    for line in lines:
+        x1, y1, x2, y2 = line
+        cv2.line(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.imshow(title, debug)
+    cv2.waitKey(1000)
+
+
+def measure_scan_lines(left, right, left_ellipse=None, right_ellipse=None):
+    left_lines = detect_lines(left)
+    right_lines = detect_lines(right)
+
+    L_px, W_px = select_cross_lines(left_lines)
+    depth_line = select_depth_line(right_lines)
+    H_px = line_length(depth_line) if depth_line is not None else None
+
+    if left_lines:
+        draw_line_overlay(left, left_lines, "Detected Left Lines")
+    if right_lines:
+        draw_line_overlay(right, right_lines, "Detected Right Lines")
+
+    if L_px is None or W_px is None or H_px is None:
+        if left_ellipse is not None:
+            L_px, W_px = get_dimensions(left_ellipse)
+        else:
+            raise ValueError("Left scan line measurement failed")
+
+        if right_ellipse is not None:
+            H_px, _ = get_dimensions(right_ellipse)
+        else:
+            raise ValueError("Right scan line measurement failed")
+
+    return L_px, W_px, H_px
 
 # ---------------------------------------------------------
 # BLADDER SEGMENTATION (IMPROVED)
@@ -240,6 +394,19 @@ def segment_bladder(image, label=""):
     return best_cnt, ellipse
 
 # ---------------------------------------------------------
+# REMOVE BLADDER FROM IMAGE
+# ---------------------------------------------------------
+def remove_bladder_volume(image, contour, fill_value=(0, 0, 0)):
+
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+
+    result = image.copy()
+    result[mask == 255] = fill_value
+
+    return result
+
+# ---------------------------------------------------------
 # EXTRACT DIMENSIONS
 # ---------------------------------------------------------
 def get_dimensions(ellipse):
@@ -300,11 +467,21 @@ def process_image(image):
     if left_ellipse is None or right_ellipse is None:
         raise ValueError("Bladder segmentation failed")
 
-    # LEFT IMAGE
-    L_px, W_px = get_dimensions(left_ellipse)
+    left_clean = remove_bladder_volume(left, left_cnt)
+    right_clean = remove_bladder_volume(right, right_cnt)
 
-    # RIGHT IMAGE
-    H_px, _ = get_dimensions(right_ellipse)
+    cv2.imshow("Left without bladder", left_clean)
+    cv2.waitKey(1000)
+
+    cv2.imshow("Right without bladder", right_clean)
+    cv2.waitKey(1000)
+
+    L_px, W_px, H_px = measure_scan_lines(
+        left,
+        right,
+        left_ellipse,
+        right_ellipse
+    )
 
     return L_px, W_px, H_px, vis
 
@@ -323,17 +500,23 @@ def compute_volume(
     print("W_px:", W_px)
     print("H_px:", H_px)
 
-    # px -> cm
-    L = (L_px * pixel_spacing) / 10
-    W = (W_px * pixel_spacing) / 10
-    H = (H_px * pixel_spacing) / 10
+    L_mm = L_px * pixel_spacing
+    W_mm = W_px * pixel_spacing
+    H_mm = H_px * pixel_spacing
+
+    L_cm = L_mm / 10
+    W_cm = W_mm / 10
+    H_cm = H_mm / 10
 
     print("\nReal Dimensions")
-    print("L:", L, "cm")
-    print("W:", W, "cm")
-    print("H:", H, "cm")
+    print(f"L: {L_mm:.2f} mm ({L_cm:.2f} cm)")
+    print(f"W: {W_mm:.2f} mm ({W_cm:.2f} cm)")
+    print(f"H: {H_mm:.2f} mm ({H_cm:.2f} cm)")
 
-    volume = 0.52 * L * W * H
+    # Bladder volume is computed from the three 2D measurement lines:
+    #   - left scan cross-lines → L and W
+    #   - right scan slanted depth line → H
+    volume = 0.52 * L_cm * W_cm * H_cm
 
     return volume
 
@@ -342,7 +525,7 @@ def compute_volume(
 # ---------------------------------------------------------
 if __name__ == "__main__":
 
-    image_path = "img012.jpg"
+    image_path = r"img012.jpg"
 
     image = cv2.imread(image_path)
 
