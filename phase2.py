@@ -498,7 +498,7 @@ def compute_volume(d1_px, d2_px, d3_px, pixel_spacing):
 
 if __name__ == "__main__":
 
-    image_path = r"img012.jpg"
+    image_path = r"img01.jpg"
 
     image = cv2.imread(image_path)
 

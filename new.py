@@ -31,7 +31,7 @@ def auto_detect_roi(image):
     for cnt in contours:
         area = cv2.contourArea(cnt)
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if area > 20000 and ch > h * 0.4 and cw > w * 0.2:
+        if area > 0.01 * h * w and ch > h * 0.35 and cw > w * 0.15:
             valid.append(cnt)
     valid = sorted(valid, key=cv2.contourArea, reverse=True)[:2]
     if len(valid) == 0:
@@ -325,7 +325,7 @@ def compute_volume(d1_px, d2_px, d3_px, pixel_spacing):
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    image_path = r"image_test.png"
+    image_path = r"image.png"
 
     image = cv2.imread(image_path)
     if image is None:
