@@ -1,41 +1,10 @@
-# =========================================================
-# GEOMETRIC BLADDER VOLUME ESTIMATION — v2
-# Generic, vendor-agnostic, automatic pipeline.
-#
-# Key changes vs. v1 (see CHANGELOG at bottom of file):
-#   1. Depth-text OCR regex fixed to survive line breaks.
-#   2. Bladder segmentation no longer bleeds into the black
-#      background outside the ultrasound sector, or into the
-#      on-screen info-panel text column.
-#   3. Segmentation candidates must contain an automatically
-#      placed interior seed point (robustness check).
-#   4. Dimensions are extracted as rotation-invariant Feret
-#      diameter + perpendicular caliper width (PCA/axis-aligned
-#      vertical & horizontal distance silently assumed the
-#      bladder was aligned to image rows/cols, which is not
-#      guaranteed).
-#   5. d1/d2/d3 are no longer hardcoded to "left panel gives
-#      d1,d2 / right panel gives d3". Instead each panel's two
-#      principal axes are computed independently, and the axis
-#      that AGREES most closely between the two panels is taken
-#      as the shared (antero-posterior) dimension — this works
-#      regardless of which panel is sagittal/transverse or which
-#      measurement convention the sonographer/machine used.
-#   6. No silent fallbacks: any time the pipeline has to guess
-#      (depth calibration, segmentation confidence, single-panel
-#      images) it prints an explicit WARNING so the caller knows
-#      the result may be less reliable.
-#   7. All cv2.imshow/waitKey calls removed (script now runs
-#      headlessly) — debug visualizations are saved as PNG files
-#      instead, which also makes it inspectable/auditable.
-# =========================================================
-
 import cv2
 import numpy as np
 import pytesseract
 import re
 import os
 import sys
+from skimage.segmentation import chan_vese
 
 DEBUG_DIR = "debug_output"
 
@@ -53,41 +22,12 @@ def warn(msg):
 
 
 # =========================================================
-# ROI DETECTION
+# ROI is now always supplied directly via process_image(roi_box=...)
+# — auto_detect_roi() was removed since it's no longer used for
+# anything; detection is replaced entirely by the caller-supplied box.
 # =========================================================
-def auto_detect_roi(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    kernel = np.ones((5, 5), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=2)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    h, w = gray.shape
-    valid = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        if area > 0.01 * h * w and ch > h * 0.35 and cw > w * 0.15:
-            valid.append(cnt)
-    valid = sorted(valid, key=cv2.contourArea, reverse=True)[:2]
-    if len(valid) == 0:
-        raise ValueError("ROI detection failed — no ultrasound sector found")
-    x_min, y_min = 99999, 99999
-    x_max, y_max = 0, 0
-    for cnt in valid:
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        x_min, y_min = min(x_min, x), min(y_min, y)
-        x_max, y_max = max(x_max, x + cw), max(y_max, y + ch)
-    roi = image[y_min:y_max, x_min:x_max]
-    return roi, (x_min, y_min, x_max, y_max)
 
 
-# =========================================================
-# PANEL SPLIT
-# Generic improvements: wider search band (25-75% instead of
-# 40-60%), and an explicit single-panel fallback — if no
-# meaningful brightness dip exists, this is a single-view image
-# and should not be force-split in half.
-# =========================================================
 def split_panels(roi):
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -110,15 +50,7 @@ def split_panels(roi):
     return [left, right], True
 
 
-# =========================================================
-# PIXEL SPACING
-# Fix: OCR can split "D" and the depth value across lines
-# (e.g. "...D/O\n15.0\n..."). The old regex required them on
-# the same line and silently fell back to a hardcoded 14.0 cm
-# whenever OCR wrapped. We now flatten whitespace/newlines
-# before searching, and warn loudly if calibration still fails
-# instead of silently guessing.
-# =========================================================
+
 def get_pixel_spacing_auto(image, panel_height_px):
     h_img, w_img = image.shape[:2]
     info_strip = image[:, int(w_img * 0.85):]
@@ -148,29 +80,7 @@ def get_pixel_spacing_auto(image, panel_height_px):
     return mm_per_px
 
 
-# =========================================================
-# BLADDER SEGMENTATION
-#
-# v1 problem: a global Otsu/fixed threshold sweep + a large
-# (15x15, 3-iteration) morphological closing routinely fused
-# the anechoic bladder region with (a) the black background
-# outside the ultrasound sector's corners, and (b) the dark
-# background behind the on-screen info-panel text — both threshold
-# to the same value as bladder fluid, and the large closing
-# kernel bridges the gap between them into one blob.
-#
-# Fixes:
-#   - Flood-fill from the 4 crop corners on a near-black mask to
-#     identify true background, and exclude it before contour
-#     search (stops corner-wedge bleed).
-#   - A larger right-side margin specifically (info-panel text
-#     overlaps the right portion of whichever panel is rightmost).
-#   - An automatically placed interior seed point (darkest pixel
-#     in a central zone, blurred to avoid noise): any candidate
-#     contour that doesn't contain this point is rejected. This
-#     is a cheap, generic "is this actually the bladder, not some
-#     other dark blob" sanity check.
-# =========================================================
+
 def _find_seed(panel, zone=(0.25, 0.75, 0.15, 0.75)):
     gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -180,7 +90,152 @@ def _find_seed(panel, zone=(0.25, 0.75, 0.15, 0.75)):
     blurred = cv2.GaussianBlur(central, (15, 15), 0)
     min_idx = np.unravel_index(np.argmin(blurred), blurred.shape)
     return (cx0 + min_idx[1], cy0 + min_idx[0])
+from scipy.ndimage import distance_transform_edt  # not used directly anymore,
+                                                    # kept here only as a reminder
+                                                    # of what NOT to use (see notes)
+from skimage.segmentation import chan_vese
+import time
 
+
+def _ellipse_level_set(shape, center, axes, angle_deg):
+    h, w = shape
+    yv, xv = np.mgrid[0:h, 0:w].astype(np.float64)
+    theta = np.deg2rad(angle_deg)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    dx, dy = xv - center[0], yv - center[1]
+    xr = dx * cos_t + dy * sin_t
+    yr = -dx * sin_t + dy * cos_t
+    a, b = axes
+    e = (xr / a) ** 2 + (yr / b) ** 2
+    return 1.0 - e
+
+
+def _mask_level_set(mask):
+    """Signed-distance level set from an arbitrary binary mask (used
+    once the ellipse is no longer a pure analytic ellipse — see
+    segment_bladder_full stage 2, where it gets intersected with the
+    detected boundary)."""
+    from scipy.ndimage import distance_transform_edt
+    inside = mask > 0
+    dist_in = distance_transform_edt(inside)
+    dist_out = distance_transform_edt(~inside)
+    return dist_in - dist_out
+
+
+def segment_bladder_chanvese(panel, label="", right_margin_frac=0.05,
+                              core_tol=25, ellipse_scale=1.35,
+                              mu=0.1, max_num_iter=250, chanvese_downscale=0.35):
+    
+    gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape
+    margin_y = int(h_img * 0.08)
+    margin_x = int(w_img * 0.05)
+    margin_x_right = int(w_img * right_margin_frac)
+    crop = gray[margin_y: h_img - margin_y, margin_x: w_img - margin_x_right]
+    ch, cw = crop.shape
+
+    seed_full = _find_seed(panel)
+    seed_crop = (seed_full[0] - margin_x, seed_full[1] - margin_y)
+    if not (0 <= seed_crop[0] < cw and 0 <= seed_crop[1] < ch):
+        warn(f"[{label}] seed point outside crop")
+        return None
+    sx, sy = seed_crop
+    near_black = (crop < 25).astype(np.uint8) * 255
+    ff_mask = np.zeros((ch + 2, cw + 2), np.uint8)
+    flood_src = near_black.copy()
+    for (bx, by) in [(0, 0), (cw - 1, 0), (0, ch - 1), (cw - 1, ch - 1)]:
+        if flood_src[by, bx] == 255:
+            cv2.floodFill(flood_src, ff_mask, (bx, by), 128)
+    bg = (flood_src == 128).astype(np.uint8) * 255
+    bg = cv2.dilate(bg, np.ones((9, 9), np.uint8), iterations=1)
+    masked = crop.copy()
+    masked[bg > 0] = 255
+
+    # --- Step 1: conservative core estimate, just to anchor an ellipse. ---
+    ff = np.zeros((ch + 2, cw + 2), np.uint8)
+    flood = masked.copy()
+    cv2.floodFill(flood, ff, (int(sx), int(sy)), 200,
+                   loDiff=core_tol, upDiff=core_tol, flags=8 | cv2.FLOODFILL_FIXED_RANGE)
+    core = (ff[1:-1, 1:-1] > 0).astype(np.uint8) * 255
+    core = cv2.morphologyEx(core, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
+    contours, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        warn(f"[{label}] couldn't find an initial core to fit an ellipse to.")
+        return None
+    core_cnt = max(contours, key=cv2.contourArea)
+
+    if len(core_cnt) < 5:
+        bx, by, bw, bh = cv2.boundingRect(core_cnt)
+        center, axes, angle = (bx + bw / 2, by + bh / 2), (bw / 2, bh / 2), 0.0
+    else:
+        center, axes, angle = cv2.fitEllipse(core_cnt)
+        axes = (axes[0] / 2, axes[1] / 2)  # cv2 returns full-length axes
+    big_axes = (max(axes[0] * ellipse_scale, 5), max(axes[1] * ellipse_scale, 5))
+
+    ellipse_mask = np.zeros((ch, cw), np.uint8)
+    cv2.ellipse(ellipse_mask, (int(center[0]), int(center[1])),
+                (int(big_axes[0]), int(big_axes[1])), angle, 0, 360, 255, -1)
+
+    print(f"[{label}] running Chan-Vese ({max_num_iter} iters max, "
+          f"{chanvese_downscale:.2f}x scale)...", flush=True)
+    t0 = time.time()
+    ds = chanvese_downscale
+    if ds < 1.0:
+        small = cv2.resize(masked, None, fx=ds, fy=ds, interpolation=cv2.INTER_AREA)
+    else:
+        small = masked
+    sh, sw = small.shape
+    level_set = _ellipse_level_set((sh, sw), (center[0] * ds, center[1] * ds),
+                                    (big_axes[0] * ds, big_axes[1] * ds), angle)
+    image_f = small.astype(np.float64) / 255.0
+    seg = chan_vese(image_f, mu=mu, lambda1=1.5, lambda2=1.0, tol=1e-3,
+                     max_num_iter=max_num_iter, dt=0.5,
+                     init_level_set=level_set, extended_output=False)
+    seg_mask = seg.astype(np.uint8) * 255
+    if ds < 1.0:
+        seg_mask = cv2.resize(seg_mask, (cw, ch), interpolation=cv2.INTER_NEAREST)
+    print(f"[{label}] Chan-Vese done in {time.time()-t0:.2f}s.", flush=True)
+
+    if seg_mask[sy, sx] == 0:
+        seg_mask = 255 - seg_mask
+        seg_mask[bg > 0] = 0
+
+    seg_mask = cv2.bitwise_and(seg_mask, ellipse_mask)
+    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
+
+    contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        warn(f"[{label}] chan_vese produced an empty segmentation.")
+        return None
+    seed_pt = (float(sx), float(sy))
+    containing = [c for c in contours if cv2.pointPolygonTest(c, seed_pt, False) >= 0]
+    cnt = max(containing, key=cv2.contourArea) if containing else max(contours, key=cv2.contourArea)
+
+    area = cv2.contourArea(cnt)
+    if not (0.02 * ch * cw < area < 0.6 * ch * cw):
+        warn(f"[{label}] chan_vese result area ({area/(ch*cw):.2%} of panel) "
+             f"looks implausible — check core_tol/ellipse_scale for this image.")
+        return None
+
+    best_cnt = cnt.copy()
+    best_cnt[:, :, 0] += margin_x
+    best_cnt[:, :, 1] += margin_y
+
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    debug = panel.copy()
+    cv2.ellipse(debug, (int(center[0]) + margin_x, int(center[1]) + margin_y),
+                (int(big_axes[0]), int(big_axes[1])), angle, 0, 360, (255, 0, 0), 1)
+    cv2.drawContours(debug, [best_cnt], -1, (0, 255, 0), 2)
+    cv2.circle(debug, seed_full, 5, (0, 0, 255), -1)
+    cv2.imshow(
+        f"Segmented {label} (chan-vese)",
+        debug
+    )
+
+    cv2.waitKey(1000)
+    return best_cnt
 def segment_bladder(panel, label="", right_margin_frac=0.05):
 
     gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
@@ -420,23 +475,170 @@ def segment_bladder(panel, label="", right_margin_frac=0.05):
 
     return best_cnt
 
+
 # =========================================================
-# DIMENSION EXTRACTION
+# THE 3-STAGE PLAN (per the whiteboard sketch):
 #
-# Per clarified clinical convention:
-#   - The "orthogonal" panel (sagittal, normally LEFT) supplies
-#     d1 = max HORIZONTAL distance, d2 = max VERTICAL distance,
-#     measured axis-aligned to the image (not rotated) — this is
-#     how the caliper is actually placed: straight across, straight
-#     down.
-#   - The "diagonal" panel (transverse, normally RIGHT) supplies
-#     d3 = the longest distance across the bladder regardless of
-#     its angle (true Feret diameter) — used as the depth/AP axis.
+#   Stage 1 — "catch these boundaries first, so detection doesn't go
+#              outside": run the existing threshold-sweep +
+#              region-growing segmentation (segment_bladder) to get a
+#              rough but real boundary of the bladder wall.
 #
-# Which physical panel plays which role is configurable via
-# `diagonal_panel`, since it's normally-but-not-always the right
-# panel.
+#   Stage 2 — "the ellipse bounded inside the boundaries we already
+#              defined": fit an ellipse to that boundary, but instead
+#              of inflating it past the boundary (the old
+#              ellipse_scale > 1 approach), intersect it with the
+#              boundary mask so the ellipse can never extend past what
+#              stage 1 already found. ellipse_scale here is meant to
+#              stay close to 1.0 (a little padding only) — the
+#              boundary itself does the bounding, not the scale.
+#
+#   Stage 3 — "use Chan-Vese to bound the bladder": refine within that
+#              bounded ellipse with Chan-Vese, exactly as before.
 # =========================================================
+def segment_bladder_full(panel, label="", right_margin_frac=0.05,
+                          ellipse_scale=1.05, boundary_dilate_px=4,
+                          mu=0.1, max_num_iter=250, chanvese_downscale=0.35):
+
+    # --- Stage 1: catch the real boundary first ---
+    boundary_cnt = segment_bladder(panel, label=label, right_margin_frac=right_margin_frac)
+    if boundary_cnt is None:
+        warn(f"[{label}] stage 1 (boundary detection) failed — cannot proceed to ellipse/Chan-Vese.")
+        return None
+
+    gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape
+    margin_y = int(h_img * 0.08)
+    margin_x = int(w_img * 0.05)
+    margin_x_right = int(w_img * right_margin_frac)
+    crop = gray[margin_y:h_img - margin_y, margin_x:w_img - margin_x_right]
+    ch, cw = crop.shape
+
+    seed_full = _find_seed(panel)
+    sx, sy = seed_full[0] - margin_x, seed_full[1] - margin_y
+    if not (0 <= sx < cw and 0 <= sy < ch):
+        warn(f"[{label}] seed point outside crop")
+        return None
+
+    near_black = (crop < 25).astype(np.uint8) * 255
+    ff_mask = np.zeros((ch + 2, cw + 2), np.uint8)
+    flood_src = near_black.copy()
+    for (bx, by) in [(0, 0), (cw - 1, 0), (0, ch - 1), (cw - 1, ch - 1)]:
+        if flood_src[by, bx] == 255:
+            cv2.floodFill(flood_src, ff_mask, (bx, by), 128)
+    bg = (flood_src == 128).astype(np.uint8) * 255
+    bg = cv2.dilate(bg, np.ones((9, 9), np.uint8), iterations=1)
+    masked = crop.copy()
+    masked[bg > 0] = 255
+
+    # boundary_cnt came back in PANEL coordinates (segment_bladder adds
+    # margin_x/margin_y before returning) — shift into this crop's frame.
+    boundary_crop = boundary_cnt.copy()
+    boundary_crop[:, :, 0] -= margin_x
+    boundary_crop[:, :, 1] -= margin_y
+
+    boundary_mask = np.zeros((ch, cw), np.uint8)
+    cv2.drawContours(boundary_mask, [boundary_crop], -1, 255, -1)
+    if boundary_dilate_px > 0:
+        boundary_mask = cv2.dilate(
+            boundary_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (boundary_dilate_px * 2 + 1,) * 2),
+            iterations=1,
+        )
+
+    # --- Stage 2: ellipse, fit to the boundary and then intersected
+    # with it so it can never extend past what stage 1 found ---
+    if len(boundary_crop) < 5:
+        bx, by, bw, bh = cv2.boundingRect(boundary_crop)
+        center, axes, angle = (bx + bw / 2, by + bh / 2), (bw / 2, bh / 2), 0.0
+    else:
+        center, axes, angle = cv2.fitEllipse(boundary_crop)
+        axes = (axes[0] / 2, axes[1] / 2)
+    big_axes = (max(axes[0] * ellipse_scale, 5), max(axes[1] * ellipse_scale, 5))
+
+    raw_ellipse_mask = np.zeros((ch, cw), np.uint8)
+    cv2.ellipse(raw_ellipse_mask, (int(center[0]), int(center[1])),
+                (int(big_axes[0]), int(big_axes[1])), angle, 0, 360, 255, -1)
+
+    # the actual bound: ellipse AND boundary — this is "the ellipse
+    # bounded inside the boundaries we already defined"
+    ellipse_mask = cv2.bitwise_and(raw_ellipse_mask, boundary_mask)
+    if cv2.countNonZero(ellipse_mask) < 0.05 * ch * cw:
+        warn(f"[{label}] ellipse/boundary intersection is implausibly small — "
+             f"falling back to the raw (unclipped) ellipse for this panel.")
+        ellipse_mask = raw_ellipse_mask
+
+    debug_stage2 = panel.copy()
+    cv2.drawContours(debug_stage2, [boundary_crop + [margin_x, margin_y]], -1, (0, 165, 255), 2)
+    cv2.ellipse(debug_stage2, (int(center[0]) + margin_x, int(center[1]) + margin_y),
+                (int(big_axes[0]), int(big_axes[1])), angle, 0, 360, (255, 0, 0), 1)
+    overlay_mask_full = np.zeros((h_img, w_img), np.uint8)
+    overlay_mask_full[margin_y:h_img - margin_y, margin_x:w_img - margin_x_right] = ellipse_mask
+    contours_ell, _ = cv2.findContours(overlay_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(debug_stage2, contours_ell, -1, (0, 255, 0), 2)
+    cv2.imshow(f"Stage2 {label} ellipse bounded inside boundary", debug_stage2)
+    cv2.waitKey(800)
+
+    # --- Stage 3: Chan-Vese refine within that bounded ellipse ---
+    print(f"[{label}] running Chan-Vese ({max_num_iter} iters max, "
+          f"{chanvese_downscale:.2f}x scale)...", flush=True)
+    t0 = time.time()
+    ds = chanvese_downscale
+    if ds < 1.0:
+        small = cv2.resize(masked, None, fx=ds, fy=ds, interpolation=cv2.INTER_AREA)
+        small_ellipse_mask = cv2.resize(ellipse_mask, None, fx=ds, fy=ds, interpolation=cv2.INTER_NEAREST)
+    else:
+        small = masked
+        small_ellipse_mask = ellipse_mask
+    level_set = _mask_level_set(small_ellipse_mask)
+    image_f = small.astype(np.float64) / 255.0
+    seg = chan_vese(image_f, mu=mu, lambda1=1.5, lambda2=1.0, tol=1e-3,
+                     max_num_iter=max_num_iter, dt=0.5,
+                     init_level_set=level_set, extended_output=False)
+    seg_mask = seg.astype(np.uint8) * 255
+    if ds < 1.0:
+        seg_mask = cv2.resize(seg_mask, (cw, ch), interpolation=cv2.INTER_NEAREST)
+    print(f"[{label}] Chan-Vese done in {time.time()-t0:.2f}s.", flush=True)
+
+    if seg_mask[sy, sx] == 0:
+        seg_mask = 255 - seg_mask
+        seg_mask[bg > 0] = 0
+
+    # final guard: clip to the bounded ellipse again (belt-and-suspenders)
+    seg_mask = cv2.bitwise_and(seg_mask, ellipse_mask)
+    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
+
+    contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        warn(f"[{label}] chan_vese produced an empty segmentation.")
+        return None
+    seed_pt = (float(sx), float(sy))
+    containing = [c for c in contours if cv2.pointPolygonTest(c, seed_pt, False) >= 0]
+    cnt = max(containing, key=cv2.contourArea) if containing else max(contours, key=cv2.contourArea)
+
+    area = cv2.contourArea(cnt)
+    if not (0.02 * ch * cw < area < 0.6 * ch * cw):
+        warn(f"[{label}] chan_vese result area ({area/(ch*cw):.2%} of panel) "
+             f"looks implausible — check ellipse_scale/boundary_dilate_px for this image.")
+        return None
+
+    best_cnt = cnt.copy()
+    best_cnt[:, :, 0] += margin_x
+    best_cnt[:, :, 1] += margin_y
+
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    debug = panel.copy()
+    cv2.drawContours(debug, [boundary_cnt], -1, (0, 165, 255), 1)
+    cv2.drawContours(debug, contours_ell, -1, (255, 0, 0), 1)
+    cv2.drawContours(debug, [best_cnt], -1, (0, 255, 0), 2)
+    cv2.circle(debug, seed_full, 5, (0, 0, 255), -1)
+    cv2.imshow(f"Stage3 {label} FINAL (chan-vese)", debug)
+    cv2.waitKey(1000)
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"segmented_full_{label}.png"), debug)
+
+    return best_cnt
+
 def max_horizontal_distance(contour):
 
     x, y, w, h = cv2.boundingRect(contour)
@@ -521,16 +723,49 @@ def max_vertical_distance(contour):
 
 
 def max_diagonal_distance(contour):
-    """True Feret diameter: longest pairwise distance between any two
-    points on the convex hull, at whatever angle it falls."""
+    """Diagonal (d3) caliper distance, restricted to the top-left ->
+    bottom-right orientation:
+
+        .
+          .
+            .
+              .
+                .
+                  >
+
+    i.e. only point pairs where x and y both increase together are
+    considered (a '\\'-shaped diagonal), not the unconstrained Feret
+    diameter. The clinical d3 caliper in these scans is always drawn
+    this way (from the upper-left edge of the bladder down to its
+    lower-right edge) — picking the single longest pairwise distance
+    on the hull regardless of direction could instead land on a
+    '/'-shaped (top-right to bottom-left) pair, or a near-horizontal
+    one, if that happened to be slightly longer, which doesn't match
+    what the machine itself measures.
+    """
     hull = cv2.convexHull(contour)[:, 0, :].astype(np.float64)
     n = len(hull)
     best_dist, best_pair = 0, None
     for i in range(n):
         for j in range(i + 1, n):
-            d = np.linalg.norm(hull[i] - hull[j])
+            p1, p2 = hull[i], hull[j]
+            if p1[0] <= p2[0] and p1[1] <= p2[1]:
+                top_left, bottom_right = p1, p2
+            elif p2[0] <= p1[0] and p2[1] <= p1[1]:
+                top_left, bottom_right = p2, p1
+            else:
+                continue  # not a top-left/bottom-right oriented pair
+            d = np.linalg.norm(top_left - bottom_right)
             if d > best_dist:
-                best_dist, best_pair = d, (hull[i], hull[j])
+                best_dist, best_pair = d, (top_left, bottom_right)
+    if best_pair is None:
+        warn("No top-left->bottom-right oriented point pair found on the "
+             "hull — falling back to the unconstrained longest pair.")
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(hull[i] - hull[j])
+                if d > best_dist:
+                    best_dist, best_pair = d, (hull[i], hull[j])
     return best_dist, best_pair
 
 
@@ -608,17 +843,6 @@ def show_measurements(
     cv2.imshow(title, debug)
     cv2.waitKey(2000)
 
-# =========================================================
-# COMBINE PANELS INTO d1, d2, d3
-#
-# Per the clarified convention: one panel is the "orthogonal"
-# view (gives d1=horizontal max, d2=vertical max), the other is
-# the "diagonal" view (gives d3=longest diagonal/Feret distance,
-# used as depth). Defaults to LEFT=orthogonal, RIGHT=diagonal,
-# since that's the normal layout — override with
-# diagonal_panel="LEFT" if a given machine/operator does it the
-# other way around.
-# =========================================================
 def combine_panel_dimensions(contours_by_label, mm_per_px, diagonal_panel="RIGHT"):
     labels = list(contours_by_label.keys())
 
@@ -765,18 +989,48 @@ def show_d1_d2_d3(left_panel,
 # =========================================================
 # MAIN
 # =========================================================
-def process_image(image_path, diagonal_panel="RIGHT"):
+def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="RIGHT"):
+    """
+    Two ways to supply the ROI — use exactly one:
 
-    image = cv2.imread(image_path)
-    if image is None:
-        raise ValueError(f"Image not found: {image_path}")
+    roi_path : path to an already-cropped ROI image (e.g. "roi.png").
+        Loaded directly and used as-is — no cropping happens, and
+        image_path/roi_box are ignored. Since there's no separate
+        full-frame image in this mode, the depth-field OCR (for pixel
+        spacing) runs on this same ROI image; if the depth field isn't
+        visible within it, get_pixel_spacing_auto() will warn and fall
+        back to its default 14cm rather than fail.
 
-    # =====================================================
-    # ROI VISUALIZATION
-    # =====================================================
-    roi, (x1, y1, x2, y2) = auto_detect_roi(image)
+    image_path + roi_box : path to the full original screenshot, plus
+        (x1, y1, x2, y2) pixel coordinates to crop out of it. Depth-field
+        OCR runs on the full image (where the info column actually is).
+    """
 
-    roi_debug = image.copy()
+    if roi_path is not None:
+        roi = cv2.imread(roi_path)
+        if roi is None:
+            raise ValueError(f"ROI image not found: {roi_path}")
+        print(f"[roi] loaded pre-cropped ROI directly from '{roi_path}' "
+              f"({roi.shape[1]}x{roi.shape[0]}) — image_path/roi_box ignored.")
+        image = roi  # used below for depth-field OCR; see docstring note
+        x1, y1, x2, y2 = 0, 0, roi.shape[1], roi.shape[0]
+        roi_debug = roi.copy()
+    else:
+        if image_path is None or roi_box is None:
+            raise ValueError("Must supply either roi_path, or both image_path and roi_box.")
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Image not found: {image_path}")
+
+        x1, y1, x2, y2 = roi_box
+        h_img, w_img = image.shape[:2]
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(w_img, int(x2)), min(h_img, int(y2))
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"roi_box {roi_box} is invalid/empty after clamping to image bounds {w_img}x{h_img}")
+        roi = image[y1:y2, x1:x2]
+        print(f"[roi] using supplied roi_box=({x1},{y1},{x2},{y2})")
+        roi_debug = image.copy()
 
     cv2.rectangle(
         roi_debug,
@@ -823,7 +1077,7 @@ def process_image(image_path, diagonal_panel="RIGHT"):
             was_split and label == "RIGHT"
         ) else 0.05
 
-        cnt = segment_bladder(
+        cnt = segment_bladder_full(
             panel,
             label,
             right_margin_frac=right_margin
@@ -896,49 +1150,22 @@ def process_image(image_path, diagonal_panel="RIGHT"):
     return volume, (d1, d2, d3)
 
 if __name__ == "__main__":
-    image_path = sys.argv[1] if len(sys.argv) > 1 else "image.png"
-    process_image(image_path)
+    # Two ways to call this:
+    #   python bladder_volume_v4.py roi.png                      <- pre-cropped ROI, feed directly
+    #   python bladder_volume_v4.py roi.png RIGHT                <- same, with diagonal_panel override
+    #   python bladder_volume_v4.py full.png x1 y1 x2 y2 [RIGHT] <- full image + crop box
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python bladder_volume_v4.py roi.png [diagonal_panel]")
+        print("  python bladder_volume_v4.py full_image.png x1 y1 x2 y2 [diagonal_panel]")
+        sys.exit(1)
 
-
-# =========================================================
-# CHANGELOG (v1 -> v2)
-# =========================================================
-# - Removed all cv2.imshow/waitKey calls (script now runs
-#   headlessly; debug overlays are written to debug_output/).
-# - Fixed depth-OCR regex so it survives OCR line-wrapping
-#   instead of silently using a hardcoded 14.0cm fallback.
-# - Segmentation: added corner-background flood-fill exclusion
-#   and a wider right-margin trim, fixing major over-segmentation
-#   into the sector's black corners and the on-screen info panel.
-# - Segmentation: added an interior-seed containment check as a
-#   generic "is this really the bladder" validity test.
-# - Dimension extraction switched from axis-aligned
-#   vertical/horizontal max-distance to true (rotation-invariant)
-#   Feret diameter + perpendicular caliper width.
-# - d1/d2/d3 assignment is no longer hardcoded to "left panel
-#   gives d1+d2, right panel gives d3" — axes are now matched
-#   across panels by mm agreement, which generalizes to either
-#   measurement convention and flags low-confidence results.
-# - Panel splitting now has an explicit single-panel fallback
-#   instead of always force-splitting in half.
-# - All silent fallbacks now print explicit WARNING messages.
-#
-# KNOWN REMAINING LIMITATIONS (be aware of these):
-# - Depth calibration still relies on OCR of the vendor's info
-#   text; it has only been validated against GE Logiq/XDclear's
-#   layout. A ruler-tick-based calibration (reading the depth
-#   scale bar drawn next to each panel) would be more vendor-
-#   generic but proved unreliable to OCR at this resolution/font
-#   in testing — it's a good next investment if you need to
-#   support other vendors, but ship with a manual depth_cm
-#   override in the meantime for non-GE images.
-# - Segmentation is still a classical threshold/region approach;
-#   it was validated on this single reference image and on
-#   straightforward sector geometry. Atypical bladder shapes,
-#   very low-contrast scans, or septated/multiloculated bladders
-#   will need a learned segmentation model (e.g. a small U-Net)
-#   for production-grade robustness.
-# - The cross-panel axis matching assumes exactly one dimension
-#   is shared between the two views, which is anatomically true
-#   for standard sagittal+transverse bladder scans, but would
-#   need rethinking for any other paired-view protocol.
+    if len(sys.argv) >= 6:
+        image_path = sys.argv[1]
+        roi_box = tuple(int(v) for v in sys.argv[2:6])
+        diagonal_panel = sys.argv[6] if len(sys.argv) > 6 else "RIGHT"
+        process_image(image_path=image_path, roi_box=roi_box, diagonal_panel=diagonal_panel)
+    else:
+        roi_path = sys.argv[1]
+        diagonal_panel = sys.argv[2] if len(sys.argv) > 2 else "RIGHT"
+        process_image(roi_path=roi_path, diagonal_panel=diagonal_panel)
