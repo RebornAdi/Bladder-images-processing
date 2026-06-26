@@ -49,34 +49,195 @@ def split_panels(roi):
     print(f"[split] x={split_x}  left={left.shape[1]}px  right={right.shape[1]}px")
     return [left, right], True
 
+def _detect_ruler_tick_spacing(gray, edge="left", band_frac=0.012, min_tick_h=2, max_tick_h=20):
+    """
+    Finds the pixel spacing between consecutive minor depth-scale tick
+    marks along the image's own left or right edge, by looking for
+    short bright horizontal dashes in a thin vertical band — NOT by
+    reading any text. This is what actually fixes get_pixel_spacing_auto
+    for ROI-only inputs: the previous version searched for OCR'd "D ##.#"
+    text in an info column that simply doesn't exist once the image has
+    been cropped down to just the ultrasound panels. The tick marks,
+    on the other hand, are part of the panel itself and are always
+    present.
+
+    Returns (median_spacing_px, list_of_tick_y_centers) or (None, [])
+    if it couldn't find a confident, consistent set of ticks.
+    """
+    h, w = gray.shape
+    if edge == "left":
+        x0, x1 = int(w * 0.003), int(w * band_frac)
+    else:
+        x0, x1 = w - int(w * band_frac), w - int(w * 0.003)
+    x0, x1 = max(0, x0), min(w, x1)
+    if x1 <= x0:
+        return None, []
+
+    band = gray[:, x0:x1].astype(np.float64)
+    profile = band.mean(axis=1)
+    thresh = 80.0
+    bright = profile > thresh
+
+    clusters = []
+    start = None
+    for y in range(len(bright)):
+        if bright[y] and start is None:
+            start = y
+        elif not bright[y] and start is not None:
+            clusters.append((start, y - 1))
+            start = None
+    if start is not None:
+        clusters.append((start, len(bright) - 1))
+
+    # keep only thin, tick-shaped clusters — rejects the much taller
+    # contaminating blobs from caliper lines, the grayscale bar, and
+    # the measurement table that also live in this same edge band
+    ticks = [((a + b) / 2.0) for (a, b) in clusters if min_tick_h <= (b - a + 1) <= max_tick_h]
+    if len(ticks) < 3:
+        return None, ticks
+
+    diffs = np.diff(ticks)
+    # Find the most common spacing value via tolerance-bucketing (mode),
+    # not the plain median: rows below the visible depth scale (the
+    # measurement table, caliper text, etc.) also produce small bright
+    # clusters in this same edge band, and there are often MORE of those
+    # contaminating diffs than real tick-to-tick diffs, which can pull a
+    # plain median toward garbage even though the real ticks are clearly
+    # present and internally consistent.
+    best_count, best_diff_group = 0, None
+    for d in diffs:
+        if d <= 0:
+            continue
+        close = diffs[np.abs(diffs - d) < 0.08 * d]
+        if len(close) > best_count:
+            best_count, best_diff_group = len(close), close
+    if best_diff_group is None or best_count < 3:
+        return None, ticks
+    return float(np.mean(best_diff_group)), ticks
 
 
-def get_pixel_spacing_auto(image, panel_height_px):
-    h_img, w_img = image.shape[:2]
-    info_strip = image[:, int(w_img * 0.85):]
-    strip_up = cv2.resize(info_strip, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    strip_gray = cv2.cvtColor(strip_up, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(strip_gray, config='--psm 6')
-    flat = re.sub(r'\s+', ' ', text)
+def get_pixel_spacing_auto(image, panel_height_px, depth_cm=None, minor_tick_cm=1.0):
+    """
+    Computes mm-per-pixel for an ultrasound panel/ROI.
 
-    depth_cm = None
-    for match in re.finditer(r'D.{0,6}?(\d{1,2}\.\d)', flat):
-        val = float(match.group(1))
-        if 5.0 <= val <= 30.0:
-            depth_cm = val
+    Priority order:
+      1. depth_cm supplied manually -> use it directly, skip everything else.
+      2. Ruler tick-mark detection (NEW, default) -> finds the spacing
+         between consecutive minor depth-scale ticks on the image's own
+         left or right edge and converts directly from that. Works even
+         when the image has been cropped down to just the ROI/panels,
+         with no vendor info column visible at all.
+      3. OCR fallback (legacy) -> searches for "D <value>" text, in case
+         the full original screenshot (with its info column) was passed
+         in instead of a bare ROI crop.
+      4. Last resort -> default 14.0cm, with a loud warning, since at
+         that point the result should not be trusted.
+
+    minor_tick_cm : real-world spacing between consecutive minor ticks
+        on the depth scale (1.0cm is this machine's convention based on
+        the sample images measured). Adjust if your machine's scale
+        uses a different minor-tick increment.
+    """
+    if depth_cm is not None:
+        print(f"[pixel spacing] using manually supplied depth = {depth_cm} cm (skipping detection)")
+        depth_mm = depth_cm * 10.0
+        mm_per_px = depth_mm / panel_height_px
+        print(f"[pixel spacing] {depth_mm:.0f} mm / {panel_height_px} px = {mm_per_px:.4f} mm/px")
+        return mm_per_px
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+    # --- Stage 1 (new, primary): ruler tick-mark detection ---
+    ticks = []
+    for edge in ("left", "right"):
+        spacing_px, ticks = _detect_ruler_tick_spacing(gray, edge=edge)
+        if spacing_px is not None:
+            mm_per_px = (minor_tick_cm * 10.0) / spacing_px
+            print(f"[pixel spacing] detected {len(ticks)} ruler ticks on the {edge} edge, "
+                  f"median spacing={spacing_px:.1f}px = {minor_tick_cm:.1f}cm "
+                  f"-> mm_per_px={mm_per_px:.4f}")
+            return mm_per_px
+
+    warn(f"Could not find a clean, consistent set of ruler tick marks on either edge "
+         f"(left ticks found: {len(ticks)}) — falling back to OCR for the depth field.")
+
+    # --- Stage 2 (legacy fallback): OCR the "D ##.#" info-column text ---
+    h_img, w_img = gray.shape
+    depth_cm_found = None
+    for frac in (0.85, 0.78, 0.70, 0.60, 0.50):
+        info_strip = gray[:, int(w_img * frac):]
+        strip_up = cv2.resize(info_strip, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        text = pytesseract.image_to_string(strip_up, config='--psm 6')
+        flat = re.sub(r'\s+', ' ', text)
+        for match in re.finditer(r'D.{0,6}?(\d{1,2}\.\d)', flat):
+            val = float(match.group(1))
+            if 5.0 <= val <= 30.0:
+                depth_cm_found = val
+                break
+        if depth_cm_found is not None:
+            print(f"[pixel spacing] OCR depth = {depth_cm_found} cm (found at right-{frac:.0%} crop window)")
             break
 
-    if depth_cm is None:
-        warn("Could not OCR the depth (D) field — falling back to 14.0 cm. "
-             "Volume accuracy is NOT reliable until this is fixed (e.g. supply "
-             "depth_cm manually, or improve OCR crop region for this vendor's UI).")
-        depth_cm = 14.0
-    else:
-        print(f"[pixel spacing] OCR depth = {depth_cm} cm")
+    if depth_cm_found is None:
+        warn("Could not OCR the depth (D) field either — falling back to 14.0 cm. "
+             "Volume accuracy is NOT reliable until this is fixed — pass depth_cm=<value> "
+             "manually, or check that the image actually shows depth-scale tick marks.")
+        depth_cm_found = 14.0
 
-    depth_mm = depth_cm * 10.0
+    depth_mm = depth_cm_found * 10.0
     mm_per_px = depth_mm / panel_height_px
     print(f"[pixel spacing] {depth_mm:.0f} mm / {panel_height_px} px = {mm_per_px:.4f} mm/px")
+    return mm_per_px
+def manual_scale_calibration(image, known_distance_cm=10.0,
+                              window_name="Click the two scale-ruler ticks (e.g. 0cm and 10cm), then press any key"):
+    """
+    Lets you click two points directly on the depth-scale ruler ticks
+    visible in the image (e.g. the '0' and '10' marks) and computes
+    mm_per_px from the real pixel distance between them — sidesteps
+    OCR entirely, which is the right call when the depth text itself
+    is too distorted/cropped to read reliably, since the tick marks
+    are unambiguous and you can verify the click visually before
+    committing to it.
+
+    Click order doesn't matter. Press any key once both points are
+    placed to confirm, or Esc to cancel.
+    """
+    points = []
+    display = image.copy()
+
+    def on_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
+            points.append((x, y))
+            cv2.circle(display, (x, y), 6, (0, 0, 255), -1)
+            if len(points) == 2:
+                cv2.line(display, points[0], points[1], (0, 255, 0), 2)
+            cv2.imshow(window_name, display)
+
+    cv2.imshow(window_name, display)
+    cv2.setMouseCallback(window_name, on_click)
+    print(f"[manual calibration] click on the two ruler ticks that are "
+          f"{known_distance_cm}cm apart (e.g. the '0' and '{known_distance_cm:.0f}' marks), "
+          f"then press any key to confirm...")
+
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if key == 27:  # Esc
+            cv2.destroyWindow(window_name)
+            raise ValueError("Manual calibration cancelled (Esc pressed) before 2 points were placed.")
+        if len(points) == 2 and key != 255:
+            break
+
+    cv2.destroyWindow(window_name)
+
+    (x1, y1), (x2, y2) = points
+    pixel_dist = float(np.hypot(x2 - x1, y2 - y1))
+    if pixel_dist < 1e-3:
+        raise ValueError("The two clicked points were on top of each other — calibration failed, try again.")
+
+    known_distance_mm = known_distance_cm * 10.0
+    mm_per_px = known_distance_mm / pixel_dist
+    print(f"[manual calibration] points={points}  pixel_dist={pixel_dist:.1f}px  "
+          f"known={known_distance_mm:.0f}mm  -> mm_per_px={mm_per_px:.4f}")
     return mm_per_px
 
 
@@ -989,7 +1150,8 @@ def show_d1_d2_d3(left_panel,
 # =========================================================
 # MAIN
 # =========================================================
-def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="RIGHT"):
+def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="RIGHT",
+                   depth_cm=None, manual_calibrate=False, calibration_distance_cm=10.0):
     """
     Two ways to supply the ROI — use exactly one:
 
@@ -1004,6 +1166,14 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
     image_path + roi_box : path to the full original screenshot, plus
         (x1, y1, x2, y2) pixel coordinates to crop out of it. Depth-field
         OCR runs on the full image (where the info column actually is).
+
+    Pixel-to-mm scale, three ways (checked in this priority order):
+      1. depth_cm=<value>          — skip OCR, use this depth directly.
+      2. manual_calibrate=True     — click 2 points on the depth-scale
+         ruler ticks yourself (e.g. the '0' and '10' marks); distance
+         between them is calibration_distance_cm (default 10cm). Most
+         reliable when OCR keeps failing on a given crop/photo.
+      3. (default)                 — OCR the depth field automatically.
     """
 
     if roi_path is not None:
@@ -1062,7 +1232,10 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
     # PIXEL SPACING
     # =====================================================
     panel_height_px = panels[0].shape[0]
-    mm_per_px = get_pixel_spacing_auto(image, panel_height_px)
+    # # if manual_calibrate:
+    # mm_per_px = manual_scale_calibration(image, known_distance_cm=calibration_distance_cm)
+    # else:
+    mm_per_px = get_pixel_spacing_auto(image, panel_height_px, depth_cm=depth_cm)
 
     # =====================================================
     # SEGMENTATION
