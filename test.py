@@ -22,6 +22,36 @@ def warn(msg):
 
 
 # =========================================================
+# DISPLAY HELPER
+# cv2.imshow defaults to a WINDOW_AUTOSIZE window shown at 1:1 pixels.
+# The ROI screenshots here are ~2000-2600px wide — bigger than most
+# screens — so those windows open oversized and appear "zoomed in"
+# / clipped even though the underlying image (and all the geometry
+# computed from it) is full-resolution and correct. This helper
+# instead opens a RESIZABLE window and pre-sizes it to fit within a
+# sensible max box, preserving aspect ratio. The image data passed to
+# imshow is unchanged — only the on-screen window size is scaled —
+# so measurements are completely unaffected.
+# =========================================================
+MAX_DISPLAY_W = 900
+MAX_DISPLAY_H = 800
+
+
+def show(window_name, img, wait_ms=None):
+    h, w = img.shape[:2]
+    scale = min(MAX_DISPLAY_W / w, MAX_DISPLAY_H / h, 1.0)
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, max(1, int(w * scale)), max(1, int(h * scale)))
+        cv2.imshow(window_name, img)
+    except cv2.error:
+        # headless / no GUI backend — silently skip (measurements still run)
+        return
+    if wait_ms is not None:
+        cv2.waitKey(wait_ms)
+
+
+# =========================================================
 # ROI is now always supplied directly via process_image(roi_box=...)
 # — auto_detect_roi() was removed since it's no longer used for
 # anything; detection is replaced entirely by the caller-supplied box.
@@ -398,12 +428,7 @@ def segment_bladder_chanvese(panel, label="", right_margin_frac=0.05,
                 (int(big_axes[0]), int(big_axes[1])), angle, 0, 360, (255, 0, 0), 1)
     cv2.drawContours(debug, [best_cnt], -1, (0, 255, 0), 2)
     cv2.circle(debug, seed_full, 5, (0, 0, 255), -1)
-    cv2.imshow(
-        f"Segmented {label} (chan-vese)",
-        debug
-    )
-
-    cv2.waitKey(1000)
+    show(f"Segmented {label} (chan-vese)", debug, 1000)
     return best_cnt
 def segment_bladder(panel, label="", right_margin_frac=0.05):
 
@@ -559,11 +584,7 @@ def segment_bladder(panel, label="", right_margin_frac=0.05):
             np.ones((5, 5), np.uint8)
         )
 
-        cv2.imshow(
-            f"Seed Region {label}",
-            seed_region
-        )
-        cv2.waitKey(200)
+        show(f"Seed Region {label}", seed_region, 200)
 
         contours, _ = cv2.findContours(
             seed_region,
@@ -633,12 +654,7 @@ def segment_bladder(panel, label="", right_margin_frac=0.05):
         -1
     )
 
-    cv2.imshow(
-        f"Segmented {label}",
-        debug
-    )
-
-    cv2.waitKey(1500)
+    show(f"Segmented {label}", debug, 1500)
 
     os.makedirs(
         DEBUG_DIR,
@@ -757,8 +773,7 @@ def segment_bladder_full(panel, label="", right_margin_frac=0.05,
     overlay_mask_full[margin_y:h_img - margin_y, margin_x:w_img - margin_x_right] = ellipse_mask
     contours_ell, _ = cv2.findContours(overlay_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(debug_stage2, contours_ell, -1, (0, 255, 0), 2)
-    cv2.imshow(f"Stage2 {label} ellipse bounded inside boundary", debug_stage2)
-    cv2.waitKey(800)
+    show(f"Stage2 {label} ellipse bounded inside boundary", debug_stage2, 800)
 
     # --- Stage 3: Chan-Vese refine within that bounded ellipse ---
     print(f"[{label}] running Chan-Vese ({max_num_iter} iters max, "
@@ -827,8 +842,7 @@ def segment_bladder_full(panel, label="", right_margin_frac=0.05,
     cv2.drawContours(debug, contours_ell, -1, (255, 0, 0), 1)
     cv2.drawContours(debug, [best_cnt], -1, (0, 255, 0), 2)
     cv2.circle(debug, seed_full, 5, (0, 0, 255), -1)
-    cv2.imshow(f"Stage3 {label} FINAL (chan-vese)", debug)
-    cv2.waitKey(1000)
+    show(f"Stage3 {label} FINAL (chan-vese)", debug, 1000)
     cv2.imwrite(os.path.join(DEBUG_DIR, f"segmented_full_{label}.png"), debug)
 
     if return_prechanvese:
@@ -1036,8 +1050,7 @@ def show_measurements(
             3
         )
 
-    cv2.imshow(title, debug)
-    cv2.waitKey(2000)
+    show(title, debug, 2000)
 
 def combine_panel_dimensions(contours_by_label, mm_per_px, diagonal_panel="RIGHT"):
     labels = list(contours_by_label.keys())
@@ -1141,7 +1154,7 @@ def show_d1_d2_d3(left_panel,
         2
     )
 
-    cv2.imshow("D1 + D2", left_debug)
+    show("D1 + D2", left_debug)
 
     right_debug = right_panel.copy()
 
@@ -1179,7 +1192,7 @@ def show_d1_d2_d3(left_panel,
         2
     )
 
-    cv2.imshow("D3", right_debug)
+    show("D3", right_debug)
 
     cv2.waitKey(0)
 # =========================================================
@@ -1245,8 +1258,7 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
         3
     )
 
-    cv2.imshow("ROI DETECTION", roi_debug)
-    cv2.waitKey(1000)
+    show("ROI DETECTION", roi_debug, 1000)
 
     # =====================================================
     # PANEL SPLIT VISUALIZATION
@@ -1254,14 +1266,10 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
     panels, was_split = split_panels(roi)
 
     if was_split:
-        cv2.imshow("LEFT PANEL", panels[0])
-        cv2.waitKey(1000)
-
-        cv2.imshow("RIGHT PANEL", panels[1])
-        cv2.waitKey(1000)
+        show("LEFT PANEL", panels[0], 1000)
+        show("RIGHT PANEL", panels[1], 1000)
     else:
-        cv2.imshow("SINGLE PANEL", panels[0])
-        cv2.waitKey(1000)
+        show("SINGLE PANEL", panels[0], 1000)
 
     # =====================================================
     # PIXEL SPACING
