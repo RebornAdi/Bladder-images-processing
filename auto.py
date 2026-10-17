@@ -8,6 +8,18 @@ from skimage.segmentation import chan_vese
 
 DEBUG_DIR = "debug_output"
 
+def _show(name, img, max_w=1100, max_h=750):
+    """Display an image scaled to fit on screen (prevents huge native-res
+    frames from appearing 'zoomed in' / overflowing the display)."""
+    h, w = img.shape[:2]
+    scale = min(max_w / float(w), max_h / float(h), 1.0)
+    disp = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                      interpolation=cv2.INTER_AREA) if scale < 1.0 else img
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.imshow(name, disp)
+    cv2.resizeWindow(name, disp.shape[1], disp.shape[0])
+
+
 
 # =========================================================
 # TESSERACT PATH (Windows only — Linux/Mac: leave as-is)
@@ -29,21 +41,13 @@ def warn(msg):
 
 
 def split_panels(roi):
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    search_start, search_end = int(w * 0.25), int(w * 0.75)
-    col_mean = np.mean(gray[:, search_start:search_end], axis=0)
-
-    rel_idx = int(np.argmin(col_mean))
-    split_x = search_start + rel_idx
-    dip_depth = col_mean.mean() - col_mean[rel_idx]
-    dip_significance = dip_depth / (col_mean.std() + 1e-6)
-
-    if dip_significance < 0.8:
-        warn("No clear panel boundary found — treating image as a single panel.")
-        return [roi], False
-
-    split_x = max(int(w * 0.30), min(split_x, int(w * 0.70)))
+    """Split a dual-panel ultrasound image straight down the middle.
+    No dip detection — the two panels are equal halves, so the split is
+    always at the horizontal centre and always returns two panels. This
+    removes the old SINGLE-panel failure path entirely (the gutter was
+    not always dark enough to clear the dip-significance gate)."""
+    h, w = roi.shape[:2]
+    split_x = w // 2
     left = roi[:, :split_x]
     right = roi[:, split_x:]
     print(f"[split] x={split_x}  left={left.shape[1]}px  right={right.shape[1]}px")
@@ -51,148 +55,176 @@ def split_panels(roi):
 
 
 
-def _detect_ruler_tick_spacing(gray, edge="left", band_frac=0.012, min_tick_h=2, max_tick_h=20):
-    """
-    Finds the pixel spacing between consecutive minor depth-scale tick
-    marks along the image's own left or right edge, by looking for
-    short bright horizontal dashes in a thin vertical band — NOT by
-    reading any text. This is what makes get_pixel_spacing_auto work on
-    ROI-only inputs: OCR-ing "D ##.#" text fails whenever the image has
-    been cropped down to just the ultrasound panels with no vendor info
-    column visible. The tick marks, by contrast, are part of the panel
-    itself and are always present.
+def remove_overlays(panel):
+    """Inpaint the bright YELLOW/GREEN annotation overlays (caliper cross
+    & diagonal lines, crosshairs) so they cannot wall off the dark bladder
+    lumen during flood-fill / thresholding. Targets the two caliper hues
+    specifically (both are low-blue), so a blue image tint is never masked.
+    No-op on a clean clinical image with no coloured overlay."""
+    if panel.ndim != 3:
+        return panel
+    b = panel[:, :, 0].astype(int)
+    g = panel[:, :, 1].astype(int)
+    r = panel[:, :, 2].astype(int)
+    yellow = (r > 120) & (g > 120) & (r - b > 50) & (g - b > 50)
+    green  = (g > 110) & (g - r > 45) & (g - b > 45)
+    mask = ((yellow | green).astype(np.uint8)) * 255
+    if cv2.countNonZero(mask) == 0:
+        return panel
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), 1)
+    return cv2.inpaint(panel, mask, 5, cv2.INPAINT_TELEA)
 
-    Validated against real caliper measurements on two separate images:
-    within 0.22% and 0.37% of ground truth respectively.
 
-    Returns (spacing_px, list_of_tick_y_centers) or (None, []) if it
-    couldn't find a confident, consistent set of ticks.
-    """
-    h, w = gray.shape
-    if edge == "left":
-        x0, x1 = int(w * 0.003), int(w * band_frac)
-    else:
-        x0, x1 = w - int(w * band_frac), w - int(w * 0.003)
-    x0, x1 = max(0, x0), min(w, x1)
-    if x1 <= x0:
-        return None, []
-
-    band = gray[:, x0:x1].astype(np.float64)
-    profile = band.mean(axis=1)
-    thresh = 80.0
-    bright = profile > thresh
-
-    clusters = []
-    start = None
+# ---------------------------------------------------------------------
+# FIX 1 : grid-consensus scale detection
+# ---------------------------------------------------------------------
+def _ticks_in_band(gray, x0, x1, min_tick_h=2, max_tick_h=24, bright_thr=80.0):
+    """Y-centres of thin bright horizontal marks in a vertical edge band."""
+    x0, x1 = max(0, int(x0)), min(gray.shape[1], int(x1))
+    if x1 - x0 < 2:
+        return []
+    prof = gray[:, x0:x1].astype(float).mean(axis=1)
+    bright = prof > bright_thr
+    cl, st = [], None
     for y in range(len(bright)):
-        if bright[y] and start is None:
-            start = y
-        elif not bright[y] and start is not None:
-            clusters.append((start, y - 1))
-            start = None
-    if start is not None:
-        clusters.append((start, len(bright) - 1))
+        if bright[y] and st is None:
+            st = y
+        elif not bright[y] and st is not None:
+            cl.append((st, y - 1)); st = None
+    if st is not None:
+        cl.append((st, len(bright) - 1))
+    return [(a + b) / 2.0 for a, b in cl if min_tick_h <= (b - a + 1) <= max_tick_h]
 
-    # keep only thin, tick-shaped clusters — rejects the much taller
-    # contaminating blobs from caliper lines, the grayscale bar, and
-    # the measurement table that also live in this same edge band
-    ticks = [((a + b) / 2.0) for (a, b) in clusters if min_tick_h <= (b - a + 1) <= max_tick_h]
-    if len(ticks) < 3:
-        return None, ticks
 
-    diffs = np.diff(ticks)
-    # Find the most common spacing value via tolerance-bucketing (mode),
-    # not the plain median: rows below the visible depth scale (the
-    # measurement table, caliper text, etc.) also produce small bright
-    # clusters in this same edge band, and there are often MORE of those
-    # contaminating diffs than real tick-to-tick diffs, which can pull a
-    # plain median toward garbage even though the real ticks are clearly
-    # present and internally consistent.
-    best_count, best_diff_group = 0, None
-    for d in diffs:
-        if d <= 0:
-            continue
-        close = diffs[np.abs(diffs - d) < 0.08 * d]
-        if len(close) > best_count:
-            best_count, best_diff_group = len(close), close
-    if best_diff_group is None or best_count < 3:
-        return None, ticks
-    return float(np.mean(best_diff_group)), ticks
+def _consensus(ticks, d, tol_px=6.0):
+    """How many DISTINCT grid slots (period d) the ticks occupy, plus span
+    and fill fraction. Counting distinct slots (not ticks) stops a cluster
+    of marks collapsing onto one slot and inflating the score, and makes
+    sub-harmonics fail the fill test."""
+    tol = max(tol_px, 0.06 * d)
+    best, best_ks = 0, None
+    for anchor in ticks:
+        k = np.round((ticks - anchor) / d)
+        sel = np.abs(ticks - (anchor + k * d)) < tol
+        if sel.any():
+            ks = np.unique(k[sel])
+            if len(ks) > best:
+                best, best_ks = len(ks), ks
+    if best_ks is None:
+        return 0, 0.0, 0.0
+    spread = int(best_ks.max() - best_ks.min())
+    span = spread * d
+    fill = best / (spread + 1) if spread >= 0 else 0.0
+    return best, span, fill
+
+
+def _grid(ticks, min_sp=12.0, max_sp=400.0, min_slots=5):
+    """Best regular spacing for a set of tick positions, by grid consensus.
+    Candidates are the pairwise gaps; we keep those with >= min_slots
+    aligned slots and fill >= 0.70 (rejects half-spacing harmonics, which
+    have fill ~0.5), then take max slot count, tie-broken by larger spacing
+    (rejects double-spacing harmonics, which have ~half the slots)."""
+    ticks = np.array(sorted(ticks), float)
+    if len(ticks) < min_slots:
+        return None
+    cand = set()
+    for i in range(len(ticks)):
+        for j in range(i + 1, len(ticks)):
+            gap = ticks[j] - ticks[i]
+            if min_sp <= gap <= max_sp:
+                cand.add(round(gap, 1))
+    res = []
+    for d in sorted(cand):
+        n, span, fill = _consensus(ticks, d)
+        if n >= min_slots and fill >= 0.70:
+            res.append((n, fill, d, span))
+    if not res:
+        return None
+    res.sort(key=lambda r: (r[0], r[2]))
+    n, fill, d, span = res[-1]
+    return dict(d=d, slots=n, fill=fill, span=span)
+
+
+def _best_on_side(gray, edge):
+    """Auto-locate the ruler on one side by scanning several sub-bands and
+    keeping the one with the strongest grid (handles rulers that sit a few
+    percent in from the edge, and skips contaminated columns)."""
+    h, w = gray.shape
+    best = None
+    for fs in (0.002, 0.006, 0.010, 0.015, 0.022, 0.030):
+        for bw in (0.010, 0.018, 0.028):
+            if edge == "left":
+                x0, x1 = w * fs, w * (fs + bw)
+            else:
+                x0, x1 = w * (1 - fs - bw), w * (1 - fs)
+            g = _grid(_ticks_in_band(gray, x0, x1))
+            if g and (best is None
+                      or g["slots"] > best["slots"]
+                      or (g["slots"] == best["slots"] and g["span"] > best["span"])):
+                best = g; best["edge"] = edge
+    return best
+
+
+def get_scale_mm_per_px(gray, panel_height_px, minor_tick_cm=1.0,
+                        depth_range=(4.0, 25.0)):
+    """Return (mm_per_px, info) from the depth ruler, or (None, None).
+    Tries both edges, prefers a plausible implied scan depth, then the
+    strongest grid."""
+    cands = []
+    for edge in ("left", "right"):
+        b = _best_on_side(gray, edge)
+        if b:
+            mmpp = (minor_tick_cm * 10.0) / b["d"]
+            depth = panel_height_px * mmpp / 10.0
+            b["mm_per_px"] = mmpp
+            b["depth"] = depth
+            b["plausible"] = depth_range[0] <= depth <= depth_range[1]
+            cands.append(b)
+    if not cands:
+        return None, None
+    usable = [c for c in cands if c["plausible"]] or cands
+    usable.sort(key=lambda c: (c["plausible"], c["slots"], c["span"]))
+    return usable[-1]["mm_per_px"], usable[-1]
 
 
 def get_pixel_spacing_auto(image, panel_height_px, depth_cm=None, minor_tick_cm=1.0):
-    """
-    Computes mm-per-pixel for an ultrasound panel/ROI.
-
-    Priority order (fully automatic by default — no manual input needed):
-      1. depth_cm supplied manually -> use it directly, skip everything else.
-         (optional override, not required)
-      2. Ruler tick-mark detection (default, automatic) -> finds the
-         spacing between consecutive minor depth-scale ticks on the
-         image's own left or right edge. Works even when the image has
-         been cropped down to just the ROI/panels, with no vendor info
-         column visible at all. Validated to within ~0.2-0.4% of true
-         caliper-derived scale on real images.
-      3. OCR fallback (legacy, automatic) -> searches for "D <value>"
-         text, in case the full original screenshot (with its info
-         column) was passed in and ticks weren't found for some reason.
-      4. Last resort -> default 14.0cm, with a loud warning — this is
-         the only path that should not be trusted.
-
-    minor_tick_cm : real-world spacing between consecutive minor ticks
-        on the depth scale (1.0cm is this machine's convention based on
-        the sample images measured). Adjust if your machine's scale
-        uses a different minor-tick increment.
-    """
+    """Drop-in replacement. Priority: manual depth -> grid-consensus ruler
+    detection -> OCR of the 'D ##.#' field -> 14 cm default (unreliable)."""
     if depth_cm is not None:
-        print(f"[pixel spacing] using manually supplied depth = {depth_cm} cm (skipping detection)")
-        depth_mm = depth_cm * 10.0
-        mm_per_px = depth_mm / panel_height_px
-        print(f"[pixel spacing] {depth_mm:.0f} mm / {panel_height_px} px = {mm_per_px:.4f} mm/px")
+        mm_per_px = (depth_cm * 10.0) / panel_height_px
+        print(f"[pixel spacing] manual depth={depth_cm}cm -> mm_per_px={mm_per_px:.4f}")
         return mm_per_px
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    mm_per_px, info = get_scale_mm_per_px(gray, panel_height_px, minor_tick_cm=minor_tick_cm)
+    if mm_per_px is not None:
+        print(f"[pixel spacing] {info['edge']} edge grid: {info['d']:.1f}px/cm "
+              f"slots={info['slots']} -> mm_per_px={mm_per_px:.4f} "
+              f"(implied depth {info['depth']:.1f}cm"
+              f"{'' if info['plausible'] else ', IMPLAUSIBLE'})")
+        return mm_per_px
 
-    # --- Stage 1 (primary, automatic): ruler tick-mark detection ---
-    ticks = []
-    for edge in ("left", "right"):
-        spacing_px, ticks = _detect_ruler_tick_spacing(gray, edge=edge)
-        if spacing_px is not None:
-            mm_per_px = (minor_tick_cm * 10.0) / spacing_px
-            print(f"[pixel spacing] detected {len(ticks)} ruler ticks on the {edge} edge, "
-                  f"median spacing={spacing_px:.1f}px = {minor_tick_cm:.1f}cm "
-                  f"-> mm_per_px={mm_per_px:.4f}")
-            return mm_per_px
-
-    warn(f"Could not find a clean, consistent set of ruler tick marks on either edge "
-         f"(left ticks found: {len(ticks)}) — falling back to OCR for the depth field.")
-
-    # --- Stage 2 (fallback, automatic): OCR the "D ##.#" info-column text ---
+    warn("No ruler grid found on either edge — falling back to OCR.")
     h_img, w_img = gray.shape
-    depth_cm_found = None
-    for frac in (0.85, 0.78, 0.70, 0.60, 0.50):
-        info_strip = gray[:, int(w_img * frac):]
-        strip_up = cv2.resize(info_strip, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        text = pytesseract.image_to_string(strip_up, config='--psm 6')
-        flat = re.sub(r'\s+', ' ', text)
-        for match in re.finditer(r'D.{0,6}?(\d{1,2}\.\d)', flat):
-            val = float(match.group(1))
-            if 5.0 <= val <= 30.0:
-                depth_cm_found = val
+    depth_found = None
+    try:
+        for frac in (0.85, 0.78, 0.70, 0.60, 0.50):
+            strip = cv2.resize(gray[:, int(w_img * frac):], None, fx=2, fy=2,
+                               interpolation=cv2.INTER_CUBIC)
+            text = re.sub(r"\s+", " ", pytesseract.image_to_string(strip, config="--psm 6"))
+            for m in re.finditer(r"D.{0,6}?(\d{1,2}\.\d)", text):
+                v = float(m.group(1))
+                if 5.0 <= v <= 30.0:
+                    depth_found = v; break
+            if depth_found:
                 break
-        if depth_cm_found is not None:
-            print(f"[pixel spacing] OCR depth = {depth_cm_found} cm (found at right-{frac:.0%} crop window)")
-            break
-
-    if depth_cm_found is None:
-        warn("Could not OCR the depth (D) field either — falling back to 14.0 cm. "
-             "Volume accuracy is NOT reliable until this is fixed — pass depth_cm=<value> "
-             "manually, or check that the image actually shows depth-scale tick marks.")
-        depth_cm_found = 14.0
-
-    depth_mm = depth_cm_found * 10.0
-    mm_per_px = depth_mm / panel_height_px
-    print(f"[pixel spacing] {depth_mm:.0f} mm / {panel_height_px} px = {mm_per_px:.4f} mm/px")
+    except Exception as e:
+        warn(f"OCR failed: {e}")
+    if depth_found is None:
+        warn("OCR failed too — defaulting to 14.0 cm (UNRELIABLE; pass depth_cm=...).")
+        depth_found = 14.0
+    mm_per_px = depth_found * 10.0 / panel_height_px
+    print(f"[pixel spacing] fallback depth={depth_found}cm -> mm_per_px={mm_per_px:.4f}")
     return mm_per_px
 
 
@@ -219,9 +251,9 @@ def manual_scale_calibration(image, known_distance_cm=10.0,
             cv2.circle(display, (x, y), 6, (0, 0, 255), -1)
             if len(points) == 2:
                 cv2.line(display, points[0], points[1], (0, 255, 0), 2)
-            cv2.imshow(window_name, display)
+            _show(window_name, display)
 
-    cv2.imshow(window_name, display)
+    _show(window_name, display)
     cv2.setMouseCallback(window_name, on_click)
     print(f"[manual calibration] click on the two ruler ticks that are "
           f"{known_distance_cm}cm apart (e.g. the '0' and '{known_distance_cm:.0f}' marks), "
@@ -398,7 +430,7 @@ def segment_bladder_chanvese(panel, label="", right_margin_frac=0.05,
                 (int(big_axes[0]), int(big_axes[1])), angle, 0, 360, (255, 0, 0), 1)
     cv2.drawContours(debug, [best_cnt], -1, (0, 255, 0), 2)
     cv2.circle(debug, seed_full, 5, (0, 0, 255), -1)
-    cv2.imshow(
+    _show(
         f"Segmented {label} (chan-vese)",
         debug
     )
@@ -559,7 +591,7 @@ def segment_bladder(panel, label="", right_margin_frac=0.05):
             np.ones((5, 5), np.uint8)
         )
 
-        cv2.imshow(
+        _show(
             f"Seed Region {label}",
             seed_region
         )
@@ -633,7 +665,7 @@ def segment_bladder(panel, label="", right_margin_frac=0.05):
         -1
     )
 
-    cv2.imshow(
+    _show(
         f"Segmented {label}",
         debug
     )
@@ -756,7 +788,7 @@ def segment_bladder_full(panel, label="", right_margin_frac=0.05,
     overlay_mask_full[margin_y:h_img - margin_y, margin_x:w_img - margin_x_right] = ellipse_mask
     contours_ell, _ = cv2.findContours(overlay_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(debug_stage2, contours_ell, -1, (0, 255, 0), 2)
-    cv2.imshow(f"Stage2 {label} ellipse bounded inside boundary", debug_stage2)
+    _show(f"Stage2 {label} ellipse bounded inside boundary", debug_stage2)
     cv2.waitKey(800)
 
     # --- Stage 3: Chan-Vese refine within that bounded ellipse ---
@@ -784,28 +816,62 @@ def segment_bladder_full(panel, label="", right_margin_frac=0.05,
         seg_mask = 255 - seg_mask
         seg_mask[bg > 0] = 0
 
-    # final guard: clip to the bounded ellipse again (belt-and-suspenders)
-    seg_mask = cv2.bitwise_and(seg_mask, ellipse_mask)
+    # final bound: clip to the STAGE-1 BOUNDARY, not the fitted ellipse.
+    # The seed-region/boundary mask is the true bladder shape (verified in
+    # the "Seed Region" debug windows); the tight ellipse was carving that
+    # correct shape down to a sub-region — the cause of the under-capture
+    # where the result covered only part of a bladder the flood had found
+    # in full. The boundary itself already prevents leaking outside the
+    # lumen, so it is the right outer limit; the ellipse is no longer used
+    # to clip the output.
+    seg_mask = cv2.bitwise_and(seg_mask, boundary_mask)
     seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_CLOSE,
                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
 
+    # Stage-1 boundary fallback, used whenever Chan-Vese collapses. Returns
+    # the Stage-1 boundary itself (the full detected lumen) — NOT carved by
+    # the ellipse, since that carving is exactly what shrank good results.
+    def _stage1_fallback(reason):
+        warn(f"[{label}] {reason} — falling back to the Stage-1 boundary.")
+        fb = np.zeros((ch, cw), np.uint8)
+        cv2.drawContours(fb, [boundary_crop], -1, 255, -1)
+        fb = cv2.morphologyEx(fb, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
+        cs, _ = cv2.findContours(fb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cs:
+            return None
+        fb_cnt = max(cs, key=cv2.contourArea)
+        if cv2.contourArea(fb_cnt) < 0.02 * ch * cw:
+            return None
+        fb_cnt = fb_cnt.copy()
+        fb_cnt[:, :, 0] += margin_x
+        fb_cnt[:, :, 1] += margin_y
+        return fb_cnt
+
     contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if len(contours) == 0:
-        warn(f"[{label}] chan_vese produced an empty segmentation.")
-        return None
-    seed_pt = (float(sx), float(sy))
-    containing = [c for c in contours if cv2.pointPolygonTest(c, seed_pt, False) >= 0]
-    cnt = max(containing, key=cv2.contourArea) if containing else max(contours, key=cv2.contourArea)
+        fb = _stage1_fallback("chan_vese produced an empty segmentation")
+        if fb is None:
+            warn(f"[{label}] Stage-1 fallback also empty — giving up on this panel.")
+            return None
+        best_cnt = fb
+    else:
+        seed_pt = (float(sx), float(sy))
+        containing = [c for c in contours if cv2.pointPolygonTest(c, seed_pt, False) >= 0]
+        cnt = max(containing, key=cv2.contourArea) if containing else max(contours, key=cv2.contourArea)
 
-    area = cv2.contourArea(cnt)
-    if not (0.02 * ch * cw < area < 0.6 * ch * cw):
-        warn(f"[{label}] chan_vese result area ({area/(ch*cw):.2%} of panel) "
-             f"looks implausible — check ellipse_scale/boundary_dilate_px for this image.")
-        return None
-
-    best_cnt = cnt.copy()
-    best_cnt[:, :, 0] += margin_x
-    best_cnt[:, :, 1] += margin_y
+        area = cv2.contourArea(cnt)
+        if not (0.02 * ch * cw < area < 0.6 * ch * cw):
+            fb = _stage1_fallback(f"chan_vese result area ({area/(ch*cw):.2%} of panel) "
+                                  f"is implausible")
+            if fb is None:
+                warn(f"[{label}] Stage-1 fallback also implausible — giving up on this panel.")
+                return None
+            best_cnt = fb
+        else:
+            best_cnt = cnt.copy()
+            best_cnt[:, :, 0] += margin_x
+            best_cnt[:, :, 1] += margin_y
 
     os.makedirs(DEBUG_DIR, exist_ok=True)
     debug = panel.copy()
@@ -813,7 +879,7 @@ def segment_bladder_full(panel, label="", right_margin_frac=0.05,
     cv2.drawContours(debug, contours_ell, -1, (255, 0, 0), 1)
     cv2.drawContours(debug, [best_cnt], -1, (0, 255, 0), 2)
     cv2.circle(debug, seed_full, 5, (0, 0, 255), -1)
-    cv2.imshow(f"Stage3 {label} FINAL (chan-vese)", debug)
+    _show(f"Stage3 {label} FINAL (chan-vese)", debug)
     cv2.waitKey(1000)
     cv2.imwrite(os.path.join(DEBUG_DIR, f"segmented_full_{label}.png"), debug)
 
@@ -1020,7 +1086,7 @@ def show_measurements(
             3
         )
 
-    cv2.imshow(title, debug)
+    _show(title, debug)
     cv2.waitKey(2000)
 
 def combine_panel_dimensions(contours_by_label, mm_per_px, diagonal_panel="RIGHT"):
@@ -1125,7 +1191,7 @@ def show_d1_d2_d3(left_panel,
         2
     )
 
-    cv2.imshow("D1 + D2", left_debug)
+    _show("D1 + D2", left_debug)
 
     right_debug = right_panel.copy()
 
@@ -1163,7 +1229,7 @@ def show_d1_d2_d3(left_panel,
         2
     )
 
-    cv2.imshow("D3", right_debug)
+    _show("D3", right_debug)
 
     cv2.waitKey(0)
 # =========================================================
@@ -1229,22 +1295,23 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
         3
     )
 
-    cv2.imshow("ROI DETECTION", roi_debug)
+    _show("ROI DETECTION", roi_debug)
     cv2.waitKey(1000)
 
     # =====================================================
     # PANEL SPLIT VISUALIZATION
     # =====================================================
     panels, was_split = split_panels(roi)
+    panels = [remove_overlays(p) for p in panels]   # inpaint caliper overlays
 
     if was_split:
-        cv2.imshow("LEFT PANEL", panels[0])
+        _show("LEFT PANEL", panels[0])
         cv2.waitKey(1000)
 
-        cv2.imshow("RIGHT PANEL", panels[1])
+        _show("RIGHT PANEL", panels[1])
         cv2.waitKey(1000)
     else:
-        cv2.imshow("SINGLE PANEL", panels[0])
+        _show("SINGLE PANEL", panels[0])
         cv2.waitKey(1000)
 
     # =====================================================
@@ -1298,39 +1365,50 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
         orthogonal_label = "RIGHT"
         diagonal_label = "LEFT"
 
-    if orthogonal_label not in contours_by_label:
-        raise ValueError(
-            f"Missing orthogonal panel: {orthogonal_label}"
+    have_orth = orthogonal_label in contours_by_label
+    have_diag = diagonal_label in contours_by_label
+
+    if have_orth and have_diag:
+        # --- normal path: both panels present ---
+        d1, d2, d3, pairs = extract_dimensions(
+            contours_by_label[orthogonal_label],
+            contours_by_label[diagonal_label],
+            mm_per_px
         )
-
-    if diagonal_label not in contours_by_label:
-        raise ValueError(
-            f"Missing diagonal panel: {diagonal_label}"
+        d1_pair, d2_pair, d3_pair = pairs
+        show_d1_d2_d3(
+            panels[labels.index(orthogonal_label)],
+            panels[labels.index(diagonal_label)],
+            contours_by_label[orthogonal_label],
+            contours_by_label[diagonal_label],
+            d1_pair, d2_pair, d3_pair
         )
-
-    # =====================================================
-    # DIMENSIONS (ONLY CALCULATED ONCE)
-    # =====================================================
-    d1, d2, d3, pairs = extract_dimensions(
-        contours_by_label[orthogonal_label],
-        contours_by_label[diagonal_label],
-        mm_per_px
-    )
-
-    d1_pair, d2_pair, d3_pair = pairs
-
-    # =====================================================
-    # VISUALIZE d1 d2 d3
-    # =====================================================
-    show_d1_d2_d3(
-        panels[labels.index(orthogonal_label)],
-        panels[labels.index(diagonal_label)],
-        contours_by_label[orthogonal_label],
-        contours_by_label[diagonal_label],
-        d1_pair,
-        d2_pair,
-        d3_pair
-    )
+    else:
+        # --- graceful single-panel fallback ---
+        # One panel failed to segment. Rather than discarding the whole
+        # image, take all three diameters from whichever panel we DO
+        # have: d1/d2 from its horizontal/vertical extent, d3 from its
+        # own TL->BR diagonal. This is a rough estimate (true 3D volume
+        # wants a second orthogonal view for the depth axis), but it is
+        # far better than failing outright, and in practice the two
+        # panels image the same bladder so the single-panel diagonal is
+        # a reasonable stand-in for the missing view's depth.
+        avail_label = orthogonal_label if have_orth else diagonal_label
+        warn(f"Only one panel segmented ('{avail_label}'); the other "
+             f"('{diagonal_label if have_orth else orthogonal_label}') failed. "
+             f"Approximating all three diameters from '{avail_label}' — "
+             f"treat this volume as a rough estimate.")
+        cnt = contours_by_label[avail_label]
+        d1_px, d1_pair = max_horizontal_distance(cnt)
+        d2_px, d2_pair = max_vertical_distance(cnt)
+        d3_px, d3_pair = max_diagonal_distance(cnt)
+        d1, d2, d3 = d1_px * mm_per_px, d2_px * mm_per_px, d3_px * mm_per_px
+        print(f"[single-panel] d1={d1:.1f}mm d2={d2:.1f}mm d3={d3:.1f}mm (all from {avail_label})")
+        show_d1_d2_d3(
+            panels[labels.index(avail_label)],
+            panels[labels.index(avail_label)],
+            cnt, cnt, d1_pair, d2_pair, d3_pair
+        )
 
     # =====================================================
     # FINAL VOLUME
@@ -1341,23 +1419,82 @@ def process_image(image_path=None, roi_box=None, roi_path=None, diagonal_panel="
 
     return volume, (d1, d2, d3)
 
+def _choose_calibration():
+    """Ask the user, in the terminal, how to calibrate the pixel->mm scale.
+    Returns kwargs to pass straight into process_image()."""
+    print("\n=== Calibration mode ===")
+    print("  [A] Auto  (detect the depth-scale ruler automatically)  [default]")
+    print("  [M] Manual click (click the two ruler ticks yourself, e.g. 0 and 10 cm)")
+    print("  [D] Depth value (type the scan depth in cm directly)")
+    choice = input("Choose A / M / D  (Enter = A): ").strip().lower()
+
+    if choice == "m":
+        d = input("  Known distance between the two ticks you'll click, in cm "
+                  "(Enter = 10): ").strip()
+        try:
+            dist = float(d) if d else 10.0
+        except ValueError:
+            dist = 10.0
+        print(f"  -> Manual click calibration ({dist} cm between the two ticks).")
+        print("     A window will open: click the two ruler ticks, then press any key.")
+        return dict(manual_calibrate=True, calibration_distance_cm=dist)
+
+    if choice == "d":
+        d = input("  Enter the scan depth in cm (e.g. 10 or 12): ").strip()
+        try:
+            depth = float(d)
+            print(f"  -> Using manual depth = {depth} cm.")
+            return dict(depth_cm=depth)
+        except ValueError:
+            print("  (not a number — falling back to Auto.)")
+            return dict()
+
+    print("  -> Auto calibration.")
+    return dict()
+
+
 if __name__ == "__main__":
     # Two ways to call this:
     #   python bladder_volume_v4.py roi.png                      <- pre-cropped ROI, feed directly
     #   python bladder_volume_v4.py roi.png RIGHT                <- same, with diagonal_panel override
     #   python bladder_volume_v4.py full.png x1 y1 x2 y2 [RIGHT] <- full image + crop box
+    #
+    # Calibration: by default you are ASKED (Auto / Manual-click / Depth).
+    # To skip the prompt, append a flag:  --manual  |  --auto  |  --depth=12
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python bladder_volume_v4.py roi.png [diagonal_panel]")
-        print("  python bladder_volume_v4.py full_image.png x1 y1 x2 y2 [diagonal_panel]")
+        print("  python bladder_volume_v4.py roi.png [diagonal_panel] [--manual|--auto|--depth=CM]")
+        print("  python bladder_volume_v4.py full_image.png x1 y1 x2 y2 [diagonal_panel] [--manual|--auto|--depth=CM]")
         sys.exit(1)
 
-    if len(sys.argv) >= 6:
-        image_path = sys.argv[1]
-        roi_box = tuple(int(v) for v in sys.argv[2:6])
-        diagonal_panel = sys.argv[6] if len(sys.argv) > 6 else "RIGHT"
-        process_image(image_path=image_path, roi_box=roi_box, diagonal_panel=diagonal_panel)
+    # pull out any calibration flag so it doesn't disturb positional parsing
+    cal_kwargs = None
+    args = []
+    for a in sys.argv[1:]:
+        al = a.lower()
+        if al == "--manual":
+            cal_kwargs = dict(manual_calibrate=True, calibration_distance_cm=10.0)
+        elif al == "--auto":
+            cal_kwargs = dict()
+        elif al.startswith("--depth="):
+            try:
+                cal_kwargs = dict(depth_cm=float(al.split("=", 1)[1]))
+            except ValueError:
+                pass
+        else:
+            args.append(a)
+
+    # if no flag was given, ask interactively
+    if cal_kwargs is None:
+        cal_kwargs = _choose_calibration()
+
+    if len(args) >= 5:
+        image_path = args[0]
+        roi_box = tuple(int(v) for v in args[1:5])
+        diagonal_panel = args[5] if len(args) > 5 else "RIGHT"
+        process_image(image_path=image_path, roi_box=roi_box,
+                      diagonal_panel=diagonal_panel, **cal_kwargs)
     else:
-        roi_path = sys.argv[1]
-        diagonal_panel = sys.argv[2] if len(sys.argv) > 2 else "RIGHT"
-        process_image(roi_path=roi_path, diagonal_panel=diagonal_panel)
+        roi_path = args[0]
+        diagonal_panel = args[1] if len(args) > 1 else "RIGHT"
+        process_image(roi_path=roi_path, diagonal_panel=diagonal_panel, **cal_kwargs)
